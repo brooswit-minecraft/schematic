@@ -1,5 +1,6 @@
 # packwiz export outputs
 build/
+__pycache__/
 *.mrpack
 *.zip
 

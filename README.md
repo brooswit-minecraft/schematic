@@ -387,3 +387,70 @@ pack, and uploads the resulting `.mrpack` as a workflow artifact.
   [Deploying to a Modrinth Server](#deploying-to-a-modrinth-server) section, and the
   `MODRINTH_SERVER_ID` row in the [secrets & variables](#secrets--variables) table
   above.
+# Server Deployment Method
+
+Repository variable `SERVER_DEPLOY_METHOD` selects `modrinth-api` (the default
+when unset) or `sftp`. Selection is explicit: API errors do not trigger SFTP.
+The existing Rinth/API behavior and credentials below are unchanged. Consumers
+such as Sickos calling `reusable-server-update.yml@v1` need no stub changes once
+this implementation is released on upstream `v1`; local edits alone do not
+update that shared tag. The SFTP job fetches its helper scripts from upstream
+Schematic `v1`, not the consumer's checkout.
+
+## SFTP Upload-Only Configuration
+
+Set these in the **consumer** repository. Missing SFTP configuration is an error,
+not a successful skip. No Modrinth API credentials are required for this path.
+
+| Kind | Name | Contract |
+| --- | --- | --- |
+| Variable | `SERVER_DEPLOY_METHOD` | `sftp` to enable uploads; unset or `modrinth-api` keeps the existing path |
+| Variable | `SERVER_SFTP_HOST` | Hosting provider's SFTP hostname |
+| Variable | `SERVER_SFTP_PORT` | SFTP port, default `22` |
+| Variable | `SERVER_SFTP_PATH` | Existing absolute server root in the SFTP account's filesystem/chroot |
+| Variable | `SERVER_SFTP_STOPPED` | Must equal `true`: operator acknowledgement that the server is externally stopped |
+| Secret | `SERVER_SFTP_USERNAME` | SFTP account username |
+| Secret | `SERVER_SFTP_PASSWORD` | Password; set exactly one of password/private key |
+| Secret | `SERVER_SFTP_PRIVATE_KEY` | Unencrypted SSH private key, alternative to password |
+| Secret | `SERVER_SFTP_KNOWN_HOSTS` | OpenSSH known_hosts entry verified out of band with the host/provider; nonstandard ports use `[host]:port` |
+
+**Stop and back up the server before enabling this path.** The stopped variable is
+an acknowledgement, not a remote power-state check. Unset it before restarting
+the server so later release events cannot upload to a running instance. No
+SSH command, loader installation, start, or restart is attempted. SFTP access
+alone does not imply access to a supported power API. Install matching Java,
+Minecraft and loader versions externally; materialization prints the release's
+runtime dependencies. A successful upload still requires an external start and
+health check. Do not use multiple controllers or modify files during upload.
+
+The source is the single `.mrpack` attached to the exact GitHub Release, not the
+default branch or a fresh packwiz resolution. Release/chained triggers wait up to
+300 seconds for its asset; manual runs require an existing release (version
+`1.2.3` selects tag `v1.2.3`). The caller's read-only `GITHUB_TOKEN` downloads the
+asset, including from private repositories. Multiple pack assets are rejected.
+The helper checks `versionId`, SHA-1, SHA-512 and file sizes; includes server
+required/optional files; excludes client-only files; applies `overrides` then
+`server-overrides`. Downloads require HTTPS, including redirects.
+
+Files are uploaded into a unique staging directory and read back for hash
+verification. The SFTP server must support the OpenSSH POSIX rename extension
+for atomic per-file overwrite. **The whole deployment is not atomic.** Only
+files recorded in `.schematic-deploy.json` are eligible for stale-file removal;
+there is no mirror-delete of the server root. Symlinks, protected server data,
+untracked mod files, and changed/untracked file collisions are refused. For a
+first migration, back up and remove old unmanaged mods and conflicting configs
+yourself; worlds and other unmanaged data are not deployment inputs. Pack paths
+containing hidden components are deliberately unsupported.
+
+A failed upload leaves `.schematic-deploy-pending` as a lock and may leave a
+`.schematic-stage-*` directory. Keep the server stopped, inspect or restore the
+backup and manifest, then remove the marker/staging directory manually before
+retrying. Never clear the marker automatically after a partial promotion.
+Unknown host keys are rejected; do not replace verification with `ssh-keyscan`
+trust-on-first-use. Downloaded pack contents must come from trusted releases.
+
+Local verification (no network or server credentials):
+
+```sh
+python3 -m unittest discover -s tests -v
+```

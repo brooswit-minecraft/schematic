@@ -48,7 +48,21 @@ on:
         type: string
 
 jobs:
+  deploy-method:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate deployment selector
+        env:
+          METHOD: ${{ vars.SERVER_DEPLOY_METHOD }}
+        run: |
+          case "${METHOD:-modrinth-api}" in
+            modrinth-api|sftp) ;;
+            *) echo '::error::SERVER_DEPLOY_METHOD must be modrinth-api or sftp'; exit 1 ;;
+          esac
+
   server-update:
+    needs: deploy-method
+    if: vars.SERVER_DEPLOY_METHOD == '' || vars.SERVER_DEPLOY_METHOD == 'modrinth-api'
     name: Update server
     runs-on: ubuntu-latest
     steps:
@@ -209,6 +223,7 @@ jobs:
               echo "::error::rinth versions latest failed (exit ${status}): ${stderr}"
               ;;
           esac
+
           exit "$status"
 
       # Attempts to re-point the server's upstream at the resolved version id
@@ -281,3 +296,83 @@ jobs:
               exit "$status"
               ;;
           esac
+
+  server-upload:
+    name: Upload server files (no restart)
+    needs: deploy-method
+    if: vars.SERVER_DEPLOY_METHOD == 'sftp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: schematic-sftp-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # A reusable workflow checks out its caller, which may not have these
+      # scripts. Fetch the implementation from the same upstream release line.
+      - uses: actions/checkout@v4
+        with:
+          repository: brooswit-minecraft/schematic
+          ref: v1
+          path: .schematic-tools
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install SFTP client
+        run: python -m pip install 'paramiko==4.0.0'
+      - name: Download exact release pack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          case "$EVENT_NAME" in
+            release) tag="$RELEASE_TAG" ;;
+            workflow_run) tag="$RUN_TAG" ;;
+            *)
+              version="${INPUT_VERSION:-$(python -c 'import tomllib; print(tomllib.load(open("pack.toml", "rb"))["version"])')}"
+              tag="v${version#v}"
+              ;;
+          esac
+          if [[ ! "$tag" =~ ^v?[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+            echo '::error::Invalid release tag'; exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/server-release"
+          attempts=1
+          if [ "$EVENT_NAME" = release ] || [ "$EVENT_NAME" = workflow_run ]; then attempts=21; fi
+          for ((i=1; i<=attempts; i++)); do
+            # Fail API/auth errors immediately; only absent release assets wait.
+            metadata="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets)"
+            count="$(jq '[.assets[] | select(.name | endswith(".mrpack"))] | length' <<< "$metadata")"
+            if [ "$count" -gt 1 ]; then echo '::error::Release has multiple mrpack assets'; exit 1; fi
+            if [ "$count" -eq 1 ]; then break; fi
+            if [ "$i" -eq "$attempts" ]; then echo '::error::Release mrpack asset not available'; exit 1; fi
+            sleep 15
+          done
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern '*.mrpack' --dir "$RUNNER_TEMP/server-release"
+          mapfile -d '' packs < <(find "$RUNNER_TEMP/server-release" -maxdepth 1 -type f -name '*.mrpack' -print0)
+          if [ "${#packs[@]}" -ne 1 ]; then echo '::error::Expected exactly one release pack'; exit 1; fi
+          python .schematic-tools/scripts/server_deploy.py materialize \
+            --archive "${packs[0]}" --version "${tag#v}" --output "$RUNNER_TEMP/server-files"
+      - name: Upload verified files to stopped server
+        env:
+          SERVER_SFTP_HOST: ${{ vars.SERVER_SFTP_HOST }}
+          SERVER_SFTP_PORT: ${{ vars.SERVER_SFTP_PORT }}
+          SERVER_SFTP_PATH: ${{ vars.SERVER_SFTP_PATH }}
+          SERVER_SFTP_STOPPED: ${{ vars.SERVER_SFTP_STOPPED }}
+          SERVER_SFTP_USERNAME: ${{ secrets.SERVER_SFTP_USERNAME }}
+          SERVER_SFTP_PASSWORD: ${{ secrets.SERVER_SFTP_PASSWORD }}
+          SERVER_SFTP_PRIVATE_KEY: ${{ secrets.SERVER_SFTP_PRIVATE_KEY }}
+          SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
+        run: python .schematic-tools/scripts/server_deploy.py upload --output "$RUNNER_TEMP/server-files"
+      - name: Report upload-only result
+        run: |
+          echo '::warning::Server files uploaded. No loader installation or server start/restart was performed. Verify the installed Minecraft/loader runtime, then start the server externally.'
+          echo 'SFTP upload complete. **Restart/start is manual; no live deployment was performed.**' >> "$GITHUB_STEP_SUMMARY"
