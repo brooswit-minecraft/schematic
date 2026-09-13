@@ -20,14 +20,16 @@ jobs:
           test -n "$PROJECT_ID" || { echo '::error::MODRINTH_PROJECT_ID is required'; exit 1; }
           test -n "$MODRINTH_TOKEN" || { echo '::error::MODRINTH_TOKEN is required'; exit 1; }
           test -f .modrinth/project.json || { echo '::error::.modrinth/project.json is required'; exit 1; }
+          test -f .modrinth/description.md || { echo '::error::.modrinth/description.md is required'; exit 1; }
           jq -e 'type == "object" and
-            ((keys - ["additional_categories","body","categories","client_side","description","issues_url","license_id","license_url","server_side","slug","source_url","title","wiki_url"]) | length == 0) and
+            ((keys - ["additional_categories","categories","client_side","description","issues_url","license_id","license_url","server_side","slug","source_url","title","wiki_url"]) | length == 0) and
             (.title | type == "string" and length > 0) and
-            (.description | type == "string" and length > 0) and
-            (.body | type == "string" and length > 0)' .modrinth/project.json >/dev/null || {
+            (.description | type == "string" and length > 0)' .modrinth/project.json >/dev/null || {
               echo '::error::Invalid or unsupported key in .modrinth/project.json'; exit 1;
             }
-          cp .modrinth/project.json "$RUNNER_TEMP/modrinth-project.json"
+          test -s .modrinth/description.md || { echo '::error::.modrinth/description.md must not be empty'; exit 1; }
+          jq --rawfile body .modrinth/description.md '. + {body: $body}' \
+            .modrinth/project.json > "$RUNNER_TEMP/modrinth-project.json"
 
       - name: Reconcile Modrinth project
         env:

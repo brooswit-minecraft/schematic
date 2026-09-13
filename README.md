@@ -390,18 +390,17 @@ pack, and uploads the resulting `.mrpack` as a workflow artifact.
 
 ## Modrinth project metadata
 
-Put the Modrinth listing fields owned by the repository in
-`.modrinth/project.json`. The `body` value may contain Markdown. A push to
-`main` that changes this file runs `modrinth-sync.yml`, PATCHes only the
-declared fields, and verifies them by reading the project back. The project id
-comes from `MODRINTH_PROJECT_ID`; authentication uses `MODRINTH_TOKEN`.
+Put structured Modrinth listing fields in `.modrinth/project.json` and the
+formatted long description in `.modrinth/description.md`. A push to `main`
+that changes either file runs `modrinth-sync.yml`, PATCHes only the declared
+fields, and verifies them by reading the project back. The project id comes
+from `MODRINTH_PROJECT_ID`; authentication uses `MODRINTH_TOKEN`.
 
 ```json
 {
   "title": "My Pack",
   "slug": "my-pack",
   "description": "A short Modrinth summary.",
-  "body": "## What this is\n\nA longer formatted description.",
   "categories": ["technology", "multiplayer"],
   "client_side": "required",
   "server_side": "required",
