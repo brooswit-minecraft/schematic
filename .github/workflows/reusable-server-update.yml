@@ -339,7 +339,7 @@ jobs:
         env:
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
           SERVER_ID: ${{ vars.MODRINTH_SERVER_ID }}
-        run: bunx --bun github:brooswit-minecraft/rinth#5a1b3e4 servers refresh-runtime "$SERVER_ID" --json
+        run: bunx --bun github:brooswit-minecraft/rinth#0e2c10e servers refresh-runtime "$SERVER_ID" --json
       - name: Verify Minecraft is ready
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
