@@ -1,18 +1,13 @@
 name: Reusable Server update
 
 # Callable from a consumer's thin server-update.yml stub. After a release
-# publishes a version to Modrinth, looks that version up and ATTEMPTS to
-# re-point a Modrinth-hosted server's upstream at it and restart it. Skips
+# publishes a version to Modrinth, looks that version up and installs it on
+# a Modrinth-hosted server. If moderation keeps the project out of Hosting's
+# catalog, it uploads the exact GitHub Release .mrpack instead. Skips
 # cleanly (and the run still succeeds) when MODRINTH_SERVER_ID /
 # MODRINTH_TOKEN are not configured — see the "Check configuration" step
 # below. Runs against the CALLER's checkout — actions/checkout below checks
 # out whichever repo invoked this workflow, not this one.
-#
-# SCHEM-21: the re-point attempt above is currently non-functional against
-# the live Modrinth API — see "Update Modrinth server" below for why — so
-# "attempts to" is accurate, not "does". The run still succeeds; a
-# `::warning::` on the run summary is how a caller finds out their server
-# didn't move.
 #
 # `github.event_name` / `github.event.release.*` here reflect the CALLER's
 # original triggering event, not a synthetic "workflow_call" event — see the
@@ -227,44 +222,13 @@ jobs:
 
           exit "$status"
 
-      # Attempts to re-point the server's upstream at the resolved version id
-      # above and restart it, via the rinth CLI. Pinned to a released tag
-      # rather than a branch ref, since a branch ref is a moving target an
-      # upstream maintainer could repoint underneath this workflow.
-      #
-      # SCHEM-21 (see epic SCHEM-9): this call is KNOWN TO FAIL against the
-      # live Modrinth API — not a bug in this workflow. The v0
-      # `POST /modrinth/v0/servers/{id}/reinstall` route `servers upstream`
-      # depends on is DEAD AT THE ROUTER: it 404s regardless of credentials,
-      # server, or project (proven upstream with a deliberately invalid
-      # token getting the byte-identical 404 — see rinth's
-      # src/diagnose.ts and its README, "Authentication — what a token can
-      # and cannot do"). Because that 404 carries no information about
-      # whether MODRINTH_SERVER_ID/MODRINTH_PROJECT_ID are actually valid,
-      # downgrading it to a warning cannot mask a real misconfiguration —
-      # there was never a way for this call to catch one in the first place.
-      # rinth (pinned #v0.9.1, verified against that exact tag) reports this
-      # under `--json` as a JSON error object on STDERR shaped
-      # `{"error":{"code":4,...,"reason":"servers_upstream_route_dead"}}`.
-      # Discriminate on that `reason` field, NEVER on "exit code was
-      # non-zero": every other failure of this step (bad token, network
-      # error, an unrecognized or missing reason, unparseable --json output)
-      # must still fail the job loudly — fail-closed, not open.
-      #
-      # `servers_credential_refused` (exit 3 — a per-server Archon 403) is
-      # DELIBERATELY downgraded the same way, even though today it can only
-      # be reached on the post-reinstall read-back or the --restart power
-      # call — both of which run after setUpstream, and setUpstream fails
-      # first on the 404 above, so this path isn't actually exercised yet.
-      # It's included on purpose: it is equally not actionable from CI
-      # today, and whether it's reachable at all is an open upstream
-      # question — RINTH-23 investigated and returned UNDECIDABLE, because
-      # the route it depends on lives in a separate Modrinth service whose
-      # router and auth guard aren't published, so it can't be settled by
-      # reading source from outside Modrinth. Leaving it
-      # fatal would just mean this step starts failing loudly again the
-      # moment that changes — for a cause exactly as undetermined as the
-      # one already being downgraded.
+      # Prefer a catalog install, which keeps the hosted server linked to the
+      # Modrinth project. Draft/processing projects are not visible to the
+      # Hosting catalog even though authenticated publishing succeeds. For
+      # that one known response, download the exact release asset and use
+      # Hosting's two-step .mrpack upload/reinstall flow. Both operations own
+      # their stop/install/start lifecycle; a successful job therefore means
+      # the new release was installed and started, not merely uploaded.
       - name: Update Modrinth server
         if: steps.config.outputs.configured == 'true'
         env:
@@ -272,9 +236,11 @@ jobs:
           SERVER_ID: ${{ vars.MODRINTH_SERVER_ID }}
           PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
           VERSION_ID: ${{ steps.modrinth_version.outputs.id }}
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set +e
-          stdout="$(bunx --bun github:brooswit-minecraft/rinth#3a97c1e servers upstream "$SERVER_ID" --project "$PROJECT_ID" --version "$VERSION_ID" --restart --json 2>/tmp/rinth_upstream_stderr.json)"
+          stdout="$(bunx --bun github:brooswit-minecraft/rinth#670d04b servers upstream "$SERVER_ID" --project "$PROJECT_ID" --version "$VERSION_ID" --restart --json 2>/tmp/rinth_upstream_stderr.json)"
           status=$?
           set -e
           stderr="$(cat /tmp/rinth_upstream_stderr.json)"
@@ -284,19 +250,22 @@ jobs:
             exit 0
           fi
 
-          [ -n "$stderr" ] && echo "$stderr"
-          reason="$(printf '%s' "$stderr" | jq -r '.error.reason // empty' 2>/dev/null || true)"
+          if ! grep -Fqi 'modpack project was not found' /tmp/rinth_upstream_stderr.json; then
+            [ -n "$stderr" ] && echo "$stderr"
+            echo "::error::rinth servers upstream failed (exit ${status}): ${stderr}"
+            exit "$status"
+          fi
 
-          case "$reason" in
-            servers_upstream_route_dead|servers_credential_refused)
-              echo "::warning::Modrinth server ${SERVER_ID} was NOT re-pointed to version ${VERSION_ID} and is NOT being kept in sync with releases. This is an upstream Modrinth limitation (rinth reason: ${reason}), not a problem with MODRINTH_SERVER_ID / MODRINTH_PROJECT_ID / MODRINTH_TOKEN. Tracked in epic SCHEM-9 and in rinth's README, \"Known gaps / follow-ups\"."
-              exit 0
-              ;;
-            *)
-              echo "::error::rinth servers upstream failed (exit ${status}, reason: ${reason:-none/unparseable}): ${stderr}"
-              exit "$status"
-              ;;
-          esac
+          echo "Catalog install cannot see the processing project; uploading the exact GitHub Release pack."
+          pack_dir="$RUNNER_TEMP/server-mrpack"
+          mkdir -p "$pack_dir"
+          gh release download "v${VERSION#v}" --repo "$GITHUB_REPOSITORY" --pattern '*.mrpack' --dir "$pack_dir"
+          mapfile -d '' packs < <(find "$pack_dir" -maxdepth 1 -type f -name '*.mrpack' -print0)
+          if [ "${#packs[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one .mrpack asset on release v${VERSION#v}; found ${#packs[@]}."
+            exit 1
+          fi
+          bunx --bun github:brooswit-minecraft/rinth#670d04b servers install-mrpack "$SERVER_ID" --file "${packs[0]}" --json
 
   server-upload:
     name: Upload server files (no restart)

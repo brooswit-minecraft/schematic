@@ -1,11 +1,8 @@
 name: Server update
 
-# After a release publishes a version to Modrinth, looks that version up and
-# ATTEMPTS to re-point a Modrinth-hosted server's upstream at it and restart
-# it — see reusable-server-update.yml for why "attempts to" is accurate, not
-# "does" (SCHEM-21: the re-point is currently non-functional against the live
-# Modrinth API; the run still succeeds, with a `::warning::` on the run
-# summary marking a server that didn't move). Skips cleanly (and the run
+# After a release publishes a version to Modrinth, installs that release on a
+# Modrinth-hosted server through the catalog or exact-release .mrpack fallback.
+# Hosting owns the stop, install, and start lifecycle. Skips cleanly (and the run
 # still succeeds) when MODRINTH_SERVER_ID / MODRINTH_TOKEN are not configured
 # — see reusable-server-update.yml.
 #
