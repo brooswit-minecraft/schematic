@@ -274,7 +274,7 @@ jobs:
           VERSION_ID: ${{ steps.modrinth_version.outputs.id }}
         run: |
           set +e
-          stdout="$(bunx --bun github:brooswit-minecraft/rinth#v0.9.1 servers upstream "$SERVER_ID" --project "$PROJECT_ID" --version "$VERSION_ID" --restart --json 2>/tmp/rinth_upstream_stderr.json)"
+          stdout="$(bunx --bun github:brooswit-minecraft/rinth#3a97c1e servers upstream "$SERVER_ID" --project "$PROJECT_ID" --version "$VERSION_ID" --restart --json 2>/tmp/rinth_upstream_stderr.json)"
           status=$?
           set -e
           stderr="$(cat /tmp/rinth_upstream_stderr.json)"
