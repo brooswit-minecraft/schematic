@@ -46,7 +46,8 @@ jobs:
   server-update:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'release')
+      (github.event.workflow_run.conclusion == 'success' &&
+       (github.event.workflow_run.event == 'release' || github.event.workflow_run.event == 'push'))
     uses: brooswit-minecraft/schematic/.github/workflows/reusable-server-update.yml@v1
     with:
       version: ${{ inputs.version }}

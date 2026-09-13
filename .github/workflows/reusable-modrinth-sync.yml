@@ -1,0 +1,58 @@
+name: Reusable Modrinth metadata sync
+
+on:
+  workflow_call:
+
+jobs:
+  sync:
+    name: Sync project metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate and build sparse project patch
+        env:
+          PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+        run: |
+          test -n "$PROJECT_ID" || { echo '::error::MODRINTH_PROJECT_ID is required'; exit 1; }
+          test -n "$MODRINTH_TOKEN" || { echo '::error::MODRINTH_TOKEN is required'; exit 1; }
+          test -f .modrinth/project.json || { echo '::error::.modrinth/project.json is required'; exit 1; }
+          jq -e 'type == "object" and
+            ((keys - ["additional_categories","body","categories","client_side","description","issues_url","license_id","license_url","server_side","slug","source_url","title","wiki_url"]) | length == 0) and
+            (.title | type == "string" and length > 0) and
+            (.description | type == "string" and length > 0) and
+            (.body | type == "string" and length > 0)' .modrinth/project.json >/dev/null || {
+              echo '::error::Invalid or unsupported key in .modrinth/project.json'; exit 1;
+            }
+          cp .modrinth/project.json "$RUNNER_TEMP/modrinth-project.json"
+
+      - name: Reconcile Modrinth project
+        env:
+          PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+        run: |
+          status="$(curl -sS -o "$RUNNER_TEMP/patch-response" -w '%{http_code}' \
+            -X PATCH "https://api.modrinth.com/v2/project/$PROJECT_ID" \
+            -H "Authorization: $MODRINTH_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -H 'User-Agent: brooswit-minecraft/schematic metadata-sync' \
+            --data-binary "@$RUNNER_TEMP/modrinth-project.json")"
+          if [ "$status" != 204 ]; then
+            cat "$RUNNER_TEMP/patch-response"
+            echo "::error::Modrinth metadata PATCH failed with HTTP $status"
+            exit 1
+          fi
+          curl -fsSL "https://api.modrinth.com/v2/project/$PROJECT_ID" \
+            -H "Authorization: $MODRINTH_TOKEN" \
+            -H 'User-Agent: brooswit-minecraft/schematic metadata-sync' \
+            > "$RUNNER_TEMP/readback.json"
+          jq -e -n --slurpfile want "$RUNNER_TEMP/modrinth-project.json" \
+            --slurpfile live "$RUNNER_TEMP/readback.json" '
+              $want[0] as $want | $live[0] as $live |
+              all($want | keys[]; . as $key | $want[$key] == $live[$key])
+            ' >/dev/null || {
+            echo '::error::Modrinth metadata read-back did not match the repository files'; exit 1;
+          }

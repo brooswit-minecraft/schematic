@@ -1,10 +1,9 @@
 name: Reusable Release
 
 # Callable from a consumer's thin release.yml stub. Builds the .mrpack,
-# attaches it to a GitHub Release, and publishes to Modrinth when configured
-# — both of those only when the caller was itself triggered by a release
-# being published; a workflow_dispatch dry run never does either, regardless
-# of Modrinth configuration. Runs against the CALLER's checkout —
+# attaches it to a GitHub Release, and publishes to Modrinth when configured.
+# A pack-changing push to main creates the release from pack.toml. The legacy
+# release event remains supported; workflow_dispatch remains a dry run.
 # actions/checkout below checks out whichever repo invoked this workflow,
 # not this one.
 #
@@ -39,8 +38,34 @@ jobs:
       - name: Resolve version
         id: ver
         env:
-          RAW_VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
-        run: echo "version=${RAW_VERSION#v}" >> "$GITHUB_OUTPUT"
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = release ]; then
+            raw="$RELEASE_TAG"
+          elif [ -n "$INPUT_VERSION" ]; then
+            raw="$INPUT_VERSION"
+          else
+            raw="$(sed -n 's/^version = "\(.*\)"/\1/p' pack.toml)"
+          fi
+          version="${raw#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::pack version must be semver-like, got '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite an existing automatic release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::GitHub Release v$VERSION already exists. Bump pack.toml before merging another pack change."
+            exit 1
+          fi
 
       - uses: actions/setup-go@v5
         with:
@@ -79,9 +104,13 @@ jobs:
           if-no-files-found: error
 
       - name: Attach .mrpack to the GitHub Release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: ${{ steps.pack.outputs.name }} v${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: ${{ github.event_name == 'push' }}
           files: build/*.mrpack
 
       # Secrets can't be referenced directly in `if:`, so map them into env
@@ -180,7 +209,7 @@ jobs:
       # make a string interpolation the only thing standing between a
       # dispatch run and a live publish.
       - name: Dry-run Modrinth publish
-        if: steps.modrinth_check.outputs.has_modrinth == 'true' && github.event_name != 'release'
+        if: steps.modrinth_check.outputs.has_modrinth == 'true' && github.event_name == 'workflow_dispatch'
         env:
           PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
           MRPACK_FILE: ${{ steps.mrpack.outputs.file }}
@@ -210,7 +239,7 @@ jobs:
       # publish a duplicate version_number (exits 5) before any upload — a
       # behaviour change from before, called out in the PR description.
       - name: Publish to Modrinth
-        if: steps.modrinth_check.outputs.has_modrinth == 'true' && github.event_name == 'release'
+        if: steps.modrinth_check.outputs.has_modrinth == 'true' && (github.event_name == 'release' || github.event_name == 'push')
         env:
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
           PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}

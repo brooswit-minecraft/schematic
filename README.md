@@ -387,6 +387,33 @@ pack, and uploads the resulting `.mrpack` as a workflow artifact.
   [Deploying to a Modrinth Server](#deploying-to-a-modrinth-server) section, and the
   `MODRINTH_SERVER_ID` row in the [secrets & variables](#secrets--variables) table
   above.
+
+## Modrinth project metadata
+
+Put the Modrinth listing fields owned by the repository in
+`.modrinth/project.json`. The `body` value may contain Markdown. A push to
+`main` that changes this file runs `modrinth-sync.yml`, PATCHes only the
+declared fields, and verifies them by reading the project back. The project id
+comes from `MODRINTH_PROJECT_ID`; authentication uses `MODRINTH_TOKEN`.
+
+```json
+{
+  "title": "My Pack",
+  "slug": "my-pack",
+  "description": "A short Modrinth summary.",
+  "body": "## What this is\n\nA longer formatted description.",
+  "categories": ["technology", "multiplayer"],
+  "client_side": "required",
+  "server_side": "required",
+  "license_id": "MIT",
+  "source_url": "https://github.com/example/my-pack",
+  "issues_url": "https://github.com/example/my-pack/issues"
+}
+```
+
+The schema deliberately excludes moderation status, permissions, members,
+monetization, gallery media, and deletion. Manage those exceptional controls
+in Modrinth rather than granting routine CI authority over them.
 # Server Deployment Method
 
 Repository variable `SERVER_DEPLOY_METHOD` selects `modrinth-api` (the default

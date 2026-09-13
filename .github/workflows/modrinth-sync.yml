@@ -1,0 +1,16 @@
+name: Modrinth metadata
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.modrinth/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    uses: brooswit-minecraft/schematic/.github/workflows/reusable-modrinth-sync.yml@v1
+    secrets: inherit

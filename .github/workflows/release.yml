@@ -1,6 +1,16 @@
 name: Release
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'pack.toml'
+      - 'index.toml'
+      - 'mods/**'
+      - 'config/**'
+      - 'defaultconfigs/**'
+      - 'resourcepacks/**'
+      - 'shaderpacks/**'
   release:
     types: [published]
   workflow_dispatch:
@@ -12,7 +22,7 @@ on:
 
 jobs:
   release:
-    # release.yml attaches an asset to a GitHub Release, so it needs write access.
+    # Creates a release on pack pushes and supports legacy manual releases.
     # ci.yml only reads the repo, so keep that workflow's permissions untouched.
     permissions:
       contents: write

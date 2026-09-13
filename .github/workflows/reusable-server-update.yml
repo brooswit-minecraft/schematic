@@ -86,11 +86,12 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           if [ "$EVENT_NAME" = "release" ]; then
             version="${RELEASE_TAG#v}"
-          elif [ "$EVENT_NAME" = "workflow_run" ]; then
+          elif [ "$EVENT_NAME" = "workflow_run" ] && [ "$WORKFLOW_RUN_EVENT" = "release" ]; then
             version="${WORKFLOW_RUN_HEAD_BRANCH#v}"
           elif [ -n "$INPUT_VERSION" ]; then
             version="$INPUT_VERSION"
@@ -331,11 +332,19 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           case "$EVENT_NAME" in
             release) tag="$RELEASE_TAG" ;;
-            workflow_run) tag="$RUN_TAG" ;;
+            workflow_run)
+              if [ "$RUN_EVENT" = release ]; then
+                tag="$RUN_TAG"
+              else
+                version="$(python -c 'import tomllib; print(tomllib.load(open("pack.toml", "rb"))["version"])')"
+                tag="v${version#v}"
+              fi
+              ;;
             *)
               version="${INPUT_VERSION:-$(python -c 'import tomllib; print(tomllib.load(open("pack.toml", "rb"))["version"])')}"
               tag="v${version#v}"
