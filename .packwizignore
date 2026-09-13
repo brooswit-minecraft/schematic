@@ -5,6 +5,7 @@ Makefile
 .gitignore
 .packwizignore
 .github/
+.modrinth/
 scripts/
 tests/
 build/
