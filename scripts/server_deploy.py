@@ -20,6 +20,48 @@ import zipfile
 
 MANIFEST = ".schematic-deploy.json"
 PENDING = ".schematic-deploy-pending"
+SUPERVISOR = ".schematic-supervisor.sh"
+SUPERVISOR_BODY = b"""#!/bin/sh
+set -u
+cd "$(dirname "$0")"
+
+# Minecraft exits normally after an RCON stop. Keep the hosting process alive
+# so release automation can relaunch it without a privileged Hosting token.
+child=""
+shutdown() {
+  trap - TERM INT HUP
+  if [ -n "$child" ]; then
+    kill -TERM "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap shutdown TERM INT HUP
+
+failures=0
+while :; do
+  started=$(date +%s)
+  ./run.sh nogui &
+  child=$!
+  wait "$child"
+  status=$?
+  child=""
+  runtime=$(($(date +%s) - started))
+  if [ "$runtime" -ge 60 ]; then
+    failures=0
+    delay=5
+  else
+    failures=$((failures + 1))
+    if [ "$failures" -ge 5 ]; then
+      printf 'Minecraft failed %s times during startup; supervisor exiting.\\n' "$failures" >&2
+      exit "$status"
+    fi
+    delay=$((10 << (failures - 1)))
+  fi
+  printf 'Minecraft exited with status %s after %ss; restarting in %ss.\\n' "$status" "$runtime" "$delay" >&2
+  sleep "$delay"
+done
+"""
 MAX_FILE = 1024 * 1024 * 1024
 MAX_TOTAL = 4 * MAX_FILE
 PROTECTED = {
@@ -144,6 +186,14 @@ def wait_for_restart(env, command=rcon_command, sleep=time.sleep, monotonic=time
         except (OSError, EOFError, TimeoutError):
             return wait_until_ready(env, command=command, sleep=sleep, monotonic=monotonic)
     raise TimeoutError("Minecraft RCON never went offline for the managed restart")
+
+
+def restart_and_wait(env, command=rcon_command, sleep=time.sleep, monotonic=time.monotonic):
+    host, port, password, _ = rcon_config(env)
+    # Flush world state before stopping. A failed save must abort the rollout.
+    command(host, port, password, "save-all flush")
+    command(host, port, password, "stop")
+    return wait_for_restart(env, command=command, sleep=sleep, monotonic=monotonic)
 
 
 def safe_path(value):
@@ -407,6 +457,17 @@ def upload(sftp, output, root):
     sftp.rmdir(stage)
 
 
+def install_supervisor(sftp, root):
+    root = root.rstrip("/")
+    target = root + "/" + SUPERVISOR
+    regular(sftp, target)
+    temporary = target + ".tmp-" + uuid.uuid4().hex
+    with sftp.open(temporary, "wb") as output:
+        output.write(SUPERVISOR_BODY)
+    sftp.chmod(temporary, 0o755)
+    sftp.posix_rename(temporary, target)
+
+
 def upload_config(env):
     required = ("SERVER_SFTP_HOST", "SERVER_SFTP_USERNAME", "SERVER_SFTP_PATH", "SERVER_SFTP_KNOWN_HOSTS")
     if any(not env.get(key) for key in required):
@@ -442,6 +503,7 @@ def connect_upload(output, env=os.environ):
             with client.open_sftp() as sftp:
                 sftp.get_channel().settimeout(60)
                 upload(sftp, output, env["SERVER_SFTP_PATH"])
+                install_supervisor(sftp, env["SERVER_SFTP_PATH"])
 
 
 def deploy(output, env=os.environ):
@@ -456,7 +518,7 @@ def deploy(output, env=os.environ):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("materialize", "deploy", "wait-ready", "wait-restarted"))
+    parser.add_argument("command", choices=("materialize", "deploy", "restart", "wait-ready", "wait-restarted"))
     parser.add_argument("--output")
     parser.add_argument("--archive")
     parser.add_argument("--version")
@@ -473,6 +535,8 @@ def main():
                 parser.error("deploy requires --output")
             deploy(args.output)
             print("Running server verified and exact release files uploaded atomically.")
+        elif args.command == "restart":
+            print(restart_and_wait(os.environ))
         elif args.command == "wait-ready":
             print(wait_until_ready(os.environ))
         else:

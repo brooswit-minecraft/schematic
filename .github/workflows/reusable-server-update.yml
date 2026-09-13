@@ -2,9 +2,9 @@ name: Reusable Server update
 
 # Callable from a consumer's thin server-update.yml stub. After a release
 # publishes a version to Modrinth, looks that version up and installs it on
-# a Modrinth-hosted server. The alternative SFTP route stops the game over
-# RCON, atomically uploads the exact GitHub Release, then refreshes Hosting's
-# existing runtime through Rinth. Skips
+# a Modrinth-hosted server. The alternative SFTP route atomically uploads the
+# exact GitHub Release, installs a small restart supervisor, then performs a
+# clean save/stop/relaunch cycle over RCON. Skips
 # cleanly (and the run still succeeds) when MODRINTH_SERVER_ID /
 # MODRINTH_TOKEN are not configured — see the "Check configuration" step
 # below. Runs against the CALLER's checkout — actions/checkout below checks
@@ -240,7 +240,7 @@ jobs:
             "$SERVER_ID" --project "$PROJECT_ID" --version "$VERSION_ID" --restart --json
 
   server-upload:
-    name: Stop, upload, and refresh server
+    name: Upload and restart server
     needs: deploy-method
     if: vars.SERVER_DEPLOY_METHOD == 'sftp'
     runs-on: ubuntu-latest
@@ -268,7 +268,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - name: Install SFTP client
         run: python -m pip install 'paramiko==4.0.0'
-      - name: Validate Hosting refresh configuration
+      - name: Validate Hosting supervisor configuration
         env:
           MODRINTH_SERVER_ID: ${{ vars.MODRINTH_SERVER_ID }}
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
@@ -321,7 +321,7 @@ jobs:
           if [ "${#packs[@]}" -ne 1 ]; then echo '::error::Expected exactly one release pack'; exit 1; fi
           python .schematic-tools/scripts/server_deploy.py materialize \
             --archive "${packs[0]}" --version "${tag#v}" --output "$RUNNER_TEMP/server-files"
-      - name: Verify running server and atomically upload files
+      - name: Verify running server, install supervisor, and atomically upload files
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
           SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
@@ -335,19 +335,19 @@ jobs:
           SERVER_SFTP_PRIVATE_KEY: ${{ secrets.SERVER_SFTP_PRIVATE_KEY }}
           SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
         run: python .schematic-tools/scripts/server_deploy.py deploy --output "$RUNNER_TEMP/server-files"
-      - name: Restart through Modrinth Hosting runtime refresh
+      - name: Configure repository-managed startup supervisor
         env:
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
           SERVER_ID: ${{ vars.MODRINTH_SERVER_ID }}
-        run: bunx --bun github:brooswit-minecraft/rinth#0e2c10e servers refresh-runtime "$SERVER_ID" --json
-      - name: Verify Minecraft restarted and is ready
+        run: bunx --bun github:brooswit-minecraft/rinth#v0.10.0 servers startup "$SERVER_ID" --command './.schematic-supervisor.sh' --json
+      - name: Save, restart, and verify Minecraft through RCON
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
           SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
           SERVER_RCON_SHUTDOWN_TIMEOUT: ${{ vars.SERVER_RCON_SHUTDOWN_TIMEOUT }}
           SERVER_RCON_PASSWORD: ${{ secrets.SERVER_RCON_PASSWORD }}
-        run: python .schematic-tools/scripts/server_deploy.py wait-restarted
+        run: python .schematic-tools/scripts/server_deploy.py restart
       - name: Report live deployment
         run: |
-          echo 'Exact release files uploaded and the Modrinth Hosting runtime restarted.'
-          echo 'SFTP deployment complete: live preflight, atomic upload, and verified Hosting restart succeeded.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Exact release files uploaded and Minecraft restarted through the managed startup supervisor.'
+          echo 'SFTP deployment complete: live preflight, atomic upload, clean RCON restart, and readiness verification succeeded.' >> "$GITHUB_STEP_SUMMARY"

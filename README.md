@@ -160,7 +160,7 @@ The default catalog integration is optional. With none of it set, `ci.yml` still
 builds and uploads the `.mrpack` as a workflow artifact, `release.yml` still builds
 and attaches it to the GitHub Release, and the catalog server-update job skips
 cleanly. Selecting `SERVER_DEPLOY_METHOD=sftp` is an explicit opt-in: all RCON,
-SFTP, and Hosting refresh settings documented below then become required and missing
+SFTP, and Hosting settings documented below then become required and missing
 configuration fails the deployment.
 
 | Name | Kind | Used by | Purpose |
@@ -213,7 +213,8 @@ The default route installs the just-published version through Modrinth Hosting's
 catalog API. A project awaiting moderation is absent from that catalog and must use
 the explicit `sftp` route described below. That route verifies the running server
 over RCON, atomically uploads the exact `.mrpack` contents from the corresponding
-GitHub Release, then asks Rinth to restart the existing Hosting runtime. The final
+GitHub Release, and restarts Minecraft through a repository-managed startup
+supervisor. The final
 gate requires RCON to go offline and return authenticated, so a green deployment
 represents the whole lifecycle.
 
@@ -419,7 +420,7 @@ Schematic `v1`, not the consumer's checkout.
 
 ## SFTP Live-Deployment Configuration
 
-Set these in the **consumer** repository. Missing RCON, SFTP, or Hosting refresh
+Set these in the **consumer** repository. Missing RCON, SFTP, or Hosting supervisor
 configuration is an error, not a successful skip. The workflow validates the live
 game and credentials before modifying files. No manual stopped-server acknowledgement
 is used.
@@ -438,17 +439,20 @@ is used.
 | Secret | `SERVER_SFTP_PASSWORD` | Password; set exactly one of password/private key |
 | Secret | `SERVER_SFTP_PRIVATE_KEY` | Unencrypted SSH private key, alternative to password |
 | Secret | `SERVER_SFTP_KNOWN_HOSTS` | OpenSSH known_hosts entry verified out of band with the host/provider; nonstandard ports use `[host]:port` |
-| Variable | `MODRINTH_SERVER_ID` | Existing Modrinth Hosting server refreshed after upload |
-| Secret | `MODRINTH_TOKEN` | Credential used by Rinth to refresh/start the Hosting runtime |
+| Variable | `MODRINTH_SERVER_ID` | Existing Modrinth Hosting server whose startup command is managed |
+| Secret | `MODRINTH_TOKEN` | Credential used by Rinth to synchronize the Hosting startup command |
 
 Enable RCON in `server.properties`, expose its allocated port, and configure the
 same password as `SERVER_RCON_PASSWORD`. The deploy helper first requires an
-authenticated RCON response, promotes release-owned files atomically, and invokes
-`rinth servers refresh-runtime <server-id>` while Hosting still considers the server
-running. Hosting owns the resulting stop/start lifecycle. The final gate must observe
-RCON become unavailable and then return an authenticated response before the job
-succeeds; an authentication failure is never interpreted as an outage. Rinth is
-pinned to the reviewed commit containing that command. Do not run another deployment
+authenticated RCON response, promotes release-owned files atomically, and installs
+`.schematic-supervisor.sh`. Rinth synchronizes the world's Hosting startup command
+to that wrapper. The workflow then flushes the world and sends `stop`; the wrapper
+relaunches Minecraft after five seconds. The final gate must observe RCON become
+unavailable and then return an authenticated response before the job succeeds; an
+authentication failure is never interpreted as an outage. Rinth is pinned to the
+reviewed release containing that command. The first migration from a plain `run.sh`
+startup needs one Hosting-panel restart after CI installs and selects the wrapper;
+later deployments are unattended. Do not run another deployment
 controller or modify server files during this sequence.
 
 The source is the single `.mrpack` attached to the exact GitHub Release, not the

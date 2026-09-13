@@ -52,6 +52,9 @@ class FakeSFTP:
     def put(self, source, target):
         shutil.copyfile(source, self.path(target))
 
+    def chmod(self, path, mode):
+        self.path(path).chmod(mode)
+
     def posix_rename(self, source, target):
         if not self.atomic:
             raise OSError("Extension unavailable")
@@ -186,6 +189,14 @@ class DeploymentTest(unittest.TestCase):
         self.assertEqual((self.remote / "server/mods/example.jar").read_bytes(), b"server")
         self.assertFalse((self.remote / "server" / deploy.PENDING).exists())
         self.assertFalse(list((self.remote / "server").glob(".schematic-stage-*")))
+
+    def test_supervisor_is_installed_atomically_and_executable(self):
+        deploy.install_supervisor(self.sftp, "/server")
+        target = self.remote / "server" / deploy.SUPERVISOR
+        self.assertEqual(target.read_bytes(), deploy.SUPERVISOR_BODY)
+        self.assertTrue(target.stat().st_mode & 0o100)
+        deploy.install_supervisor(self.sftp, "/server")
+        self.assertFalse(list((self.remote / "server").glob(deploy.SUPERVISOR + ".tmp-*")))
 
     def test_update_removes_only_tracked_stale_files(self):
         self.materialize()
@@ -357,6 +368,26 @@ class DeploymentTest(unittest.TestCase):
         with self.assertRaises(deploy.RCONAuthError):
             deploy.wait_for_restart(config, command=command, sleep=lambda _: None,
                                     monotonic=lambda: 0)
+
+    def test_restart_flushes_saves_stops_and_waits_for_return(self):
+        calls = []
+        outcomes = iter((OSError("down"), "online"))
+
+        def command(_host, _port, _password, operation, **_kwargs):
+            calls.append(operation)
+            if operation in ("save-all flush", "stop"):
+                return "ok"
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        config = {"SERVER_RCON_HOST": "server.invalid", "SERVER_RCON_PASSWORD": "secret"}
+        clock = iter((0, 0, 0, 1, 2))
+        result = deploy.restart_and_wait(config, command=command, sleep=lambda _: None,
+                                         monotonic=lambda: next(clock))
+        self.assertEqual(result, "online")
+        self.assertEqual(calls, ["save-all flush", "stop", "list", "list"])
 
     def test_deploy_verifies_readiness_before_opening_sftp(self):
         order = []
