@@ -7,6 +7,7 @@ import shutil
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 import zipfile
 
 
@@ -62,6 +63,32 @@ class FakeSFTP:
 
     def listdir_attr(self, path):
         return [SimpleNamespace(filename=p.name, st_mode=p.lstat().st_mode) for p in self.path(path).iterdir()]
+
+
+class FakeRCONSocket:
+    def __init__(self, responses):
+        self.responses = bytearray(b"".join(responses))
+        self.sent = []
+        self.timeout = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def recv(self, size):
+        # Deliberately fragment reads to exercise receive_exact.
+        size = min(size, 3, len(self.responses))
+        result = bytes(self.responses[:size])
+        del self.responses[:size]
+        return result
 
 
 class DeploymentTest(unittest.TestCase):
@@ -216,16 +243,122 @@ class DeploymentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Incomplete"):
             deploy.upload(self.sftp, self.output, "/server")
 
-    def test_configuration_requires_stopped_and_one_credential(self):
+    def test_rcon_packet_and_command(self):
+        connection = FakeRCONSocket([
+            deploy.rcon_packet(1, 2, ""),
+            deploy.rcon_packet(2, 0, "Stopping the server"),
+        ])
+        result = deploy.rcon_command("server.invalid", 25575, "secret", "stop",
+                                     connect=lambda *_args, **_kwargs: connection)
+        self.assertEqual(result, "Stopping the server")
+        self.assertEqual(connection.timeout, 10)
+        self.assertEqual(connection.sent, [deploy.rcon_packet(1, 3, "secret"),
+                                           deploy.rcon_packet(2, 2, "stop")])
+
+    def test_rcon_authentication_failure_is_distinct(self):
+        connection = FakeRCONSocket([deploy.rcon_packet(-1, 2, "")])
+        with self.assertRaises(deploy.RCONAuthError):
+            deploy.rcon_command("server.invalid", 25575, "wrong", "list",
+                                connect=lambda *_args, **_kwargs: connection)
+
+    def test_rcon_rejects_invalid_packets_and_payloads(self):
+        connection = FakeRCONSocket([b"\x01\x00\x00\x00x"])
+        with self.assertRaises(deploy.RCONError):
+            deploy.receive_rcon_packet(connection)
+        with self.assertRaisesRegex(ValueError, "null byte"):
+            deploy.rcon_packet(1, 2, "bad\0command")
+
+    def test_stop_waits_for_two_consecutive_unavailable_probes(self):
+        calls = []
+        probes = iter(("online", OSError("down"), OSError("still down")))
+
+        def command(host, port, password, operation, **_kwargs):
+            calls.append(operation)
+            if operation == "stop":
+                return "Stopping"
+            outcome = next(probes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        config = {"SERVER_RCON_HOST": "server.invalid", "SERVER_RCON_PASSWORD": "secret"}
+        clock = iter((0, 0, 1, 2))
+        deploy.stop_and_wait(config, command=command, sleep=lambda _: None,
+                             monotonic=lambda: next(clock))
+        self.assertEqual(calls, ["stop", "list", "list", "list"])
+
+    def test_stop_does_not_treat_auth_failure_as_shutdown(self):
+        def command(_host, _port, _password, operation, **_kwargs):
+            if operation == "list":
+                raise deploy.RCONAuthError("bad password")
+            return "Stopping"
+
+        config = {"SERVER_RCON_HOST": "server.invalid", "SERVER_RCON_PASSWORD": "wrong"}
+        with self.assertRaises(deploy.RCONAuthError):
+            deploy.stop_and_wait(config, command=command, sleep=lambda _: None,
+                                 monotonic=lambda: 0)
+
+    def test_stop_times_out_while_rcon_remains_available(self):
+        calls = []
+
+        def command(_host, _port, _password, operation, **_kwargs):
+            calls.append(operation)
+            return "online"
+
+        config = {"SERVER_RCON_HOST": "server.invalid", "SERVER_RCON_PASSWORD": "secret",
+                  "SERVER_RCON_SHUTDOWN_TIMEOUT": "1"}
+        clock = iter((0, 0, 1))
+        with self.assertRaises(TimeoutError):
+            deploy.stop_and_wait(config, command=command, sleep=lambda _: None,
+                                 monotonic=lambda: next(clock))
+        self.assertEqual(calls, ["stop", "list"])
+
+    def test_wait_until_ready_retries_then_returns_status(self):
+        outcomes = iter((OSError("down"), TimeoutError("starting"), "online"))
+        calls = []
+
+        def command(_host, _port, _password, operation, **_kwargs):
+            calls.append(operation)
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        config = {"SERVER_RCON_HOST": "server.invalid", "SERVER_RCON_PASSWORD": "secret"}
+        clock = iter((0, 0, 1, 2, 3))
+        result = deploy.wait_until_ready(config, command=command, sleep=lambda _: None,
+                                         monotonic=lambda: next(clock))
+        self.assertEqual(result, "online")
+        self.assertEqual(calls, ["list", "list", "list"])
+
+    def test_deploy_stops_before_opening_sftp(self):
+        order = []
+        config = {key: "test" for key in ("SERVER_RCON_HOST", "SERVER_RCON_PASSWORD",
+                                            "SERVER_SFTP_HOST", "SERVER_SFTP_USERNAME",
+                                            "SERVER_SFTP_PATH", "SERVER_SFTP_KNOWN_HOSTS")}
+        config["SERVER_SFTP_PASSWORD"] = "secret"
+        with mock.patch.object(deploy, "stop_and_wait", side_effect=lambda _env: order.append("stop")), \
+             mock.patch.object(deploy, "connect_upload", side_effect=lambda _output, _env: order.append("upload")):
+            deploy.deploy("output", config)
+        self.assertEqual(order, ["stop", "upload"])
+
+    def test_deploy_validates_all_configuration_before_stop(self):
+        with mock.patch.object(deploy, "stop_and_wait") as stop:
+            with self.assertRaises(ValueError):
+                deploy.deploy("output", {"SERVER_RCON_HOST": "host", "SERVER_RCON_PASSWORD": "secret"})
+        stop.assert_not_called()
+
+    def test_configuration_requires_rcon_sftp_and_one_credential(self):
         config = {key: "test" for key in ("SERVER_SFTP_HOST", "SERVER_SFTP_USERNAME", "SERVER_SFTP_PATH", "SERVER_SFTP_KNOWN_HOSTS")}
         config["SERVER_SFTP_PASSWORD"] = "not-a-real-password"
-        with self.assertRaisesRegex(ValueError, "Stop"):
-            deploy.upload_config(config)
-        config["SERVER_SFTP_STOPPED"] = "true"
         self.assertEqual(deploy.upload_config(config), 22)
         config["SERVER_SFTP_PRIVATE_KEY"] = "not-a-real-key"
         with self.assertRaisesRegex(ValueError, "exactly one"):
             deploy.upload_config(config)
+        self.assertEqual(deploy.rcon_config({"SERVER_RCON_HOST": "host", "SERVER_RCON_PASSWORD": "password"}),
+                         ("host", 25575, "password", 120.0))
+        with self.assertRaisesRegex(ValueError, "RCON"):
+            deploy.rcon_config({})
 
 
 if __name__ == "__main__":

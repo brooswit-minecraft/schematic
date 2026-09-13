@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Materialize a release mrpack and upload pack-owned files to a stopped server."""
+"""Materialize a release mrpack and deploy pack-owned files to a server."""
 
 import argparse
 import hashlib
@@ -7,9 +7,12 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import socket
 import stat
+import struct
 import sys
 import tempfile
+import time
 import urllib.request
 import uuid
 import zipfile
@@ -24,6 +27,109 @@ PROTECTED = {
     "crash-reports", "server.properties", "eula.txt", "ops.json", "whitelist.json",
     "banned-ips.json", "banned-players.json", "usercache.json", "session.lock",
 }
+
+
+class RCONError(Exception):
+    """The RCON peer returned an invalid response."""
+
+
+class RCONAuthError(RCONError):
+    """The RCON peer rejected the configured password."""
+
+
+def rcon_packet(request_id, packet_type, body):
+    if "\0" in body:
+        raise ValueError("RCON payload contains a null byte")
+    payload = struct.pack("<ii", request_id, packet_type) + body.encode("utf-8") + b"\0\0"
+    if len(payload) > 4 * 1024 * 1024:
+        raise ValueError("RCON payload is too large")
+    return struct.pack("<i", len(payload)) + payload
+
+
+def receive_exact(connection, size):
+    chunks = []
+    while size:
+        chunk = connection.recv(size)
+        if not chunk:
+            raise EOFError("RCON connection closed")
+        chunks.append(chunk)
+        size -= len(chunk)
+    return b"".join(chunks)
+
+
+def receive_rcon_packet(connection):
+    length = struct.unpack("<i", receive_exact(connection, 4))[0]
+    if not 10 <= length <= 4 * 1024 * 1024:
+        raise RCONError("Invalid RCON packet length")
+    payload = receive_exact(connection, length)
+    request_id, packet_type = struct.unpack("<ii", payload[:8])
+    if payload[-2:] != b"\0\0":
+        raise RCONError("Invalid RCON packet terminator")
+    try:
+        body = payload[8:-2].decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RCONError("Invalid RCON response encoding") from error
+    return request_id, packet_type, body
+
+
+def rcon_command(host, port, password, command, timeout=10, connect=socket.create_connection):
+    with connect((host, port), timeout=timeout) as connection:
+        connection.settimeout(timeout)
+        connection.sendall(rcon_packet(1, 3, password))
+        request_id, packet_type, _ = receive_rcon_packet(connection)
+        if request_id == -1:
+            raise RCONAuthError("RCON authentication failed")
+        if request_id != 1 or packet_type != 2:
+            raise RCONError("Unexpected RCON authentication response")
+        connection.sendall(rcon_packet(2, 2, command))
+        request_id, packet_type, body = receive_rcon_packet(connection)
+        if request_id != 2 or packet_type != 0:
+            raise RCONError("Unexpected RCON command response")
+        return body
+
+
+def rcon_config(env):
+    if not env.get("SERVER_RCON_HOST") or not env.get("SERVER_RCON_PASSWORD"):
+        raise ValueError("Missing required RCON configuration")
+    port = int(env.get("SERVER_RCON_PORT") or "25575")
+    timeout = float(env.get("SERVER_RCON_SHUTDOWN_TIMEOUT") or "120")
+    if not 1 <= port <= 65535:
+        raise ValueError("Invalid RCON port")
+    if not 1 <= timeout <= 600:
+        raise ValueError("Invalid RCON shutdown timeout")
+    return env["SERVER_RCON_HOST"], port, env["SERVER_RCON_PASSWORD"], timeout
+
+
+def stop_and_wait(env, command=rcon_command, sleep=time.sleep, monotonic=time.monotonic):
+    host, port, password, shutdown_timeout = rcon_config(env)
+    command(host, port, password, "stop")
+    deadline = monotonic() + shutdown_timeout
+    unavailable = 0
+    while monotonic() < deadline:
+        sleep(1)
+        try:
+            command(host, port, password, "list", timeout=5)
+            unavailable = 0
+        except RCONAuthError:
+            raise
+        except (OSError, EOFError, TimeoutError):
+            unavailable += 1
+            if unavailable >= 2:
+                return
+    raise TimeoutError("Minecraft RCON remained available after stop command")
+
+
+def wait_until_ready(env, command=rcon_command, sleep=time.sleep, monotonic=time.monotonic):
+    host, port, password, startup_timeout = rcon_config(env)
+    deadline = monotonic() + startup_timeout
+    while monotonic() < deadline:
+        try:
+            return command(host, port, password, "list", timeout=5)
+        except RCONAuthError:
+            raise
+        except (OSError, EOFError, TimeoutError):
+            sleep(2)
+    raise TimeoutError("Minecraft RCON did not become ready after runtime refresh")
 
 
 def safe_path(value):
@@ -291,8 +397,6 @@ def upload_config(env):
     required = ("SERVER_SFTP_HOST", "SERVER_SFTP_USERNAME", "SERVER_SFTP_PATH", "SERVER_SFTP_KNOWN_HOSTS")
     if any(not env.get(key) for key in required):
         raise ValueError("Missing required SFTP configuration")
-    if env.get("SERVER_SFTP_STOPPED") != "true":
-        raise ValueError("Stop the server externally and set SERVER_SFTP_STOPPED=true")
     if bool(env.get("SERVER_SFTP_PASSWORD")) == bool(env.get("SERVER_SFTP_PRIVATE_KEY")):
         raise ValueError("Configure exactly one SFTP password or private key")
     port = int(env.get("SERVER_SFTP_PORT") or "22")
@@ -301,9 +405,8 @@ def upload_config(env):
     return port
 
 
-def connect_upload(output):
+def connect_upload(output, env=os.environ):
     import paramiko
-    env = os.environ
     port = upload_config(env)
     with tempfile.TemporaryDirectory() as temporary:
         host_file = Path(temporary) / "known_hosts"
@@ -327,26 +430,39 @@ def connect_upload(output):
                 upload(sftp, output, env["SERVER_SFTP_PATH"])
 
 
+def deploy(output, env=os.environ):
+    # Validate every credential before taking a running server offline.
+    rcon_config(env)
+    upload_config(env)
+    # Do not open SFTP until the game has actually released its files.
+    stop_and_wait(env)
+    connect_upload(output, env)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("materialize", "upload"))
-    parser.add_argument("--output", required=True)
+    parser.add_argument("command", choices=("materialize", "deploy", "wait-ready"))
+    parser.add_argument("--output")
     parser.add_argument("--archive")
     parser.add_argument("--version")
     args = parser.parse_args()
     try:
         if args.command == "materialize":
-            if not args.archive or not args.version:
-                parser.error("materialize requires --archive and --version")
+            if not args.archive or not args.version or not args.output:
+                parser.error("materialize requires --archive, --version and --output")
             result = materialize(args.archive, args.output, args.version)
             print("Verified server files:", len(result["files"]))
             print("Required runtime dependencies:", json.dumps(result["dependencies"]))
+        elif args.command == "deploy":
+            if not args.output:
+                parser.error("deploy requires --output")
+            deploy(args.output)
+            print("Server stopped and exact release files uploaded atomically.")
         else:
-            connect_upload(args.output)
-            print("Upload complete. Server was NOT started/restarted; verify runtime and start externally.")
+            print(wait_until_ready(os.environ))
     except Exception as error:
         # SSH/network exceptions may contain credentials, URLs or host details.
-        print("Deployment failed (" + type(error).__name__ + "). Check configuration, pack integrity, remote ownership and pending marker. No server power action was attempted.", file=sys.stderr)
+        print("Deployment failed (" + type(error).__name__ + "). Check RCON/SFTP configuration, pack integrity, remote ownership and pending marker.", file=sys.stderr)
         return 1
     return 0
 

@@ -2,8 +2,9 @@ name: Reusable Server update
 
 # Callable from a consumer's thin server-update.yml stub. After a release
 # publishes a version to Modrinth, looks that version up and installs it on
-# a Modrinth-hosted server. If moderation keeps the project out of Hosting's
-# catalog, it uploads the exact GitHub Release .mrpack instead. Skips
+# a Modrinth-hosted server. The alternative SFTP route stops the game over
+# RCON, atomically uploads the exact GitHub Release, then refreshes Hosting's
+# existing runtime through Rinth. Skips
 # cleanly (and the run still succeeds) when MODRINTH_SERVER_ID /
 # MODRINTH_TOKEN are not configured — see the "Check configuration" step
 # below. Runs against the CALLER's checkout — actions/checkout below checks
@@ -222,13 +223,9 @@ jobs:
 
           exit "$status"
 
-      # Prefer a catalog install, which keeps the hosted server linked to the
-      # Modrinth project. Draft/processing projects are not visible to the
-      # Hosting catalog even though authenticated publishing succeeds. For
-      # that one known response, download the exact release asset and use
-      # Hosting's two-step .mrpack upload/reinstall flow. Both operations own
-      # their stop/install/start lifecycle; a successful job therefore means
-      # the new release was installed and started, not merely uploaded.
+      # This path keeps the hosted server linked to a catalog-visible Modrinth
+      # project. Draft/processing projects must use the explicit SFTP route;
+      # Hosting's local-mrpack credential cannot be obtained with a PAT.
       - name: Update Modrinth server
         if: steps.config.outputs.configured == 'true'
         env:
@@ -239,36 +236,11 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          set +e
-          stdout="$(bunx --bun github:brooswit-minecraft/rinth#670d04b servers upstream "$SERVER_ID" --project "$PROJECT_ID" --version "$VERSION_ID" --restart --json 2>/tmp/rinth_upstream_stderr.json)"
-          status=$?
-          set -e
-          stderr="$(cat /tmp/rinth_upstream_stderr.json)"
-
-          if [ "$status" -eq 0 ]; then
-            [ -n "$stdout" ] && echo "$stdout"
-            exit 0
-          fi
-
-          if ! grep -Fqi 'modpack project was not found' /tmp/rinth_upstream_stderr.json; then
-            [ -n "$stderr" ] && echo "$stderr"
-            echo "::error::rinth servers upstream failed (exit ${status}): ${stderr}"
-            exit "$status"
-          fi
-
-          echo "Catalog install cannot see the processing project; uploading the exact GitHub Release pack."
-          pack_dir="$RUNNER_TEMP/server-mrpack"
-          mkdir -p "$pack_dir"
-          gh release download "v${VERSION#v}" --repo "$GITHUB_REPOSITORY" --pattern '*.mrpack' --dir "$pack_dir"
-          mapfile -d '' packs < <(find "$pack_dir" -maxdepth 1 -type f -name '*.mrpack' -print0)
-          if [ "${#packs[@]}" -ne 1 ]; then
-            echo "::error::Expected exactly one .mrpack asset on release v${VERSION#v}; found ${#packs[@]}."
-            exit 1
-          fi
-          bunx --bun github:brooswit-minecraft/rinth#670d04b servers install-mrpack "$SERVER_ID" --file "${packs[0]}" --json
+          bunx --bun github:brooswit-minecraft/rinth#670d04b servers upstream \
+            "$SERVER_ID" --project "$PROJECT_ID" --version "$VERSION_ID" --restart --json
 
   server-upload:
-    name: Upload server files (no restart)
+    name: Stop, upload, and refresh server
     needs: deploy-method
     if: vars.SERVER_DEPLOY_METHOD == 'sftp'
     runs-on: ubuntu-latest
@@ -293,8 +265,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: oven-sh/setup-bun@v2
       - name: Install SFTP client
         run: python -m pip install 'paramiko==4.0.0'
+      - name: Validate Hosting refresh configuration
+        env:
+          MODRINTH_SERVER_ID: ${{ vars.MODRINTH_SERVER_ID }}
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+        run: |
+          if [ -z "$MODRINTH_SERVER_ID" ] || [ -z "$MODRINTH_TOKEN" ]; then
+            echo '::error::The sftp deployment route requires MODRINTH_SERVER_ID and MODRINTH_TOKEN.'
+            exit 1
+          fi
       - name: Download exact release pack
         env:
           GH_TOKEN: ${{ github.token }}
@@ -339,18 +321,33 @@ jobs:
           if [ "${#packs[@]}" -ne 1 ]; then echo '::error::Expected exactly one release pack'; exit 1; fi
           python .schematic-tools/scripts/server_deploy.py materialize \
             --archive "${packs[0]}" --version "${tag#v}" --output "$RUNNER_TEMP/server-files"
-      - name: Upload verified files to stopped server
+      - name: Stop server and atomically upload verified files
         env:
+          SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
+          SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
+          SERVER_RCON_SHUTDOWN_TIMEOUT: ${{ vars.SERVER_RCON_SHUTDOWN_TIMEOUT }}
+          SERVER_RCON_PASSWORD: ${{ secrets.SERVER_RCON_PASSWORD }}
           SERVER_SFTP_HOST: ${{ vars.SERVER_SFTP_HOST }}
           SERVER_SFTP_PORT: ${{ vars.SERVER_SFTP_PORT }}
           SERVER_SFTP_PATH: ${{ vars.SERVER_SFTP_PATH }}
-          SERVER_SFTP_STOPPED: ${{ vars.SERVER_SFTP_STOPPED }}
           SERVER_SFTP_USERNAME: ${{ secrets.SERVER_SFTP_USERNAME }}
           SERVER_SFTP_PASSWORD: ${{ secrets.SERVER_SFTP_PASSWORD }}
           SERVER_SFTP_PRIVATE_KEY: ${{ secrets.SERVER_SFTP_PRIVATE_KEY }}
           SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
-        run: python .schematic-tools/scripts/server_deploy.py upload --output "$RUNNER_TEMP/server-files"
-      - name: Report upload-only result
+        run: python .schematic-tools/scripts/server_deploy.py deploy --output "$RUNNER_TEMP/server-files"
+      - name: Start and refresh Modrinth Hosting runtime
+        env:
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          SERVER_ID: ${{ vars.MODRINTH_SERVER_ID }}
+        run: bunx --bun github:brooswit-minecraft/rinth#5a1b3e4 servers refresh-runtime "$SERVER_ID" --json
+      - name: Verify Minecraft is ready
+        env:
+          SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
+          SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
+          SERVER_RCON_SHUTDOWN_TIMEOUT: ${{ vars.SERVER_RCON_SHUTDOWN_TIMEOUT }}
+          SERVER_RCON_PASSWORD: ${{ secrets.SERVER_RCON_PASSWORD }}
+        run: python .schematic-tools/scripts/server_deploy.py wait-ready
+      - name: Report live deployment
         run: |
-          echo '::warning::Server files uploaded. No loader installation or server start/restart was performed. Verify the installed Minecraft/loader runtime, then start the server externally.'
-          echo 'SFTP upload complete. **Restart/start is manual; no live deployment was performed.**' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Exact release files uploaded and the Modrinth Hosting runtime refreshed.'
+          echo 'SFTP deployment complete: RCON shutdown, atomic upload, and Hosting runtime refresh succeeded.' >> "$GITHUB_STEP_SUMMARY"

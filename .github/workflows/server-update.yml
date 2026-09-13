@@ -1,10 +1,10 @@
 name: Server update
 
 # After a release publishes a version to Modrinth, installs that release on a
-# Modrinth-hosted server through the catalog or exact-release .mrpack fallback.
-# Hosting owns the stop, install, and start lifecycle. Skips cleanly (and the run
-# still succeeds) when MODRINTH_SERVER_ID / MODRINTH_TOKEN are not configured
-# — see reusable-server-update.yml.
+# Modrinth-hosted server through either the catalog or the explicitly selected
+# RCON/SFTP exact-release route. Skips cleanly (and the run still succeeds) on
+# the default catalog route when MODRINTH_SERVER_ID / MODRINTH_TOKEN are not
+# configured; the selected SFTP route requires its full configuration.
 #
 # Chained on the "Release" workflow's completion (workflow_run) rather than
 # on `release: published` directly, so this only starts once release.yml has

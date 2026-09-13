@@ -156,16 +156,19 @@ attention at all.
 
 ## Secrets & variables
 
-Everything below is optional. With none of them set, `ci.yml` still builds and uploads
-the `.mrpack` as a workflow artifact, `release.yml` still builds and attaches it to the
-GitHub Release, and any workflow step that needs a secret **skips cleanly** (the run
-still finishes green) when it isn't configured.
+The default catalog integration is optional. With none of it set, `ci.yml` still
+builds and uploads the `.mrpack` as a workflow artifact, `release.yml` still builds
+and attaches it to the GitHub Release, and the catalog server-update job skips
+cleanly. Selecting `SERVER_DEPLOY_METHOD=sftp` is an explicit opt-in: all RCON,
+SFTP, and Hosting refresh settings documented below then become required and missing
+configuration fails the deployment.
 
 | Name | Kind | Used by | Purpose |
 |---|---|---|---|
 | `MODRINTH_TOKEN` | secret | `release.yml`, `server-update.yml` | Auth token for publishing to Modrinth and updating a Modrinth-hosted server |
 | `MODRINTH_PROJECT_ID` | variable | `release.yml`, `server-update.yml` | Identifies which Modrinth project to publish to / follow |
 | `MODRINTH_SERVER_ID` | variable | `server-update.yml` | The Modrinth-hosted server to keep in sync with releases |
+| `SERVER_DEPLOY_METHOD` | variable | `server-update.yml` | Selects `modrinth-api` (default) or `sftp`; see the complete SFTP configuration below |
 
 ## Releasing
 
@@ -206,18 +209,19 @@ published to Modrinth — or on demand via `workflow_dispatch` (with an optional
 `server-update.yml` still uses the older `release: published` trigger — it keeps
 working unchanged, and switching is optional.
 
-The workflow first installs the just-published version through Modrinth Hosting's
-catalog API. While a project is awaiting moderation and absent from that catalog, it
-falls back to uploading the exact `.mrpack` attached to the corresponding GitHub
-Release. Both paths use Hosting's reinstall lifecycle, which stops the server,
-installs the pack, and starts it again. Other API, authentication, or asset errors
-remain fatal, so a green deployment means the install request completed.
+The default route installs the just-published version through Modrinth Hosting's
+catalog API. A project awaiting moderation is absent from that catalog and must use
+the explicit `sftp` route described below. That route stops Minecraft over RCON,
+waits until the game/RCON endpoint is down, atomically uploads the exact `.mrpack`
+contents from the corresponding GitHub Release, then asks Rinth to refresh and start
+the existing Hosting runtime. Authentication, shutdown, asset, upload, and refresh
+errors are fatal, so a green deployment represents the whole lifecycle.
 
 One-time setup:
 
 1. Buy a Modrinth Server.
-2. Optionally install the pack once from your Modrinth project. The workflow's upload
-   fallback also works while a new project is awaiting moderation.
+2. Install the pack once from your Modrinth project, or configure the `sftp` route
+   while a new project is awaiting moderation.
 3. Find the server's id: it's the UUID in the dashboard URL
    `modrinth.com/hosting/manage/<server_id>`. It's also returned as `server_id` by
    `rinth servers list` (or `GET https://archon.modrinth.com/modrinth/v0/servers`).
@@ -413,31 +417,38 @@ this implementation is released on upstream `v1`; local edits alone do not
 update that shared tag. The SFTP job fetches its helper scripts from upstream
 Schematic `v1`, not the consumer's checkout.
 
-## SFTP Upload-Only Configuration
+## SFTP Live-Deployment Configuration
 
-Set these in the **consumer** repository. Missing SFTP configuration is an error,
-not a successful skip. No Modrinth API credentials are required for this path.
+Set these in the **consumer** repository. Missing RCON, SFTP, or Hosting refresh
+configuration is an error, not a successful skip. The workflow validates credentials
+before taking the game offline. No manual stopped-server acknowledgement is used.
 
 | Kind | Name | Contract |
 | --- | --- | --- |
 | Variable | `SERVER_DEPLOY_METHOD` | `sftp` to enable uploads; unset or `modrinth-api` keeps the existing path |
+| Variable | `SERVER_RCON_HOST` | Public hostname or address for the Minecraft server's RCON allocation |
+| Variable | `SERVER_RCON_PORT` | RCON port, default `25575` |
+| Variable | `SERVER_RCON_SHUTDOWN_TIMEOUT` | Seconds to wait for game/RCON shutdown, default `120`, maximum `600` |
+| Secret | `SERVER_RCON_PASSWORD` | Password matching `rcon.password` in `server.properties` |
 | Variable | `SERVER_SFTP_HOST` | Hosting provider's SFTP hostname |
 | Variable | `SERVER_SFTP_PORT` | SFTP port, default `22` |
 | Variable | `SERVER_SFTP_PATH` | Existing absolute server root in the SFTP account's filesystem/chroot |
-| Variable | `SERVER_SFTP_STOPPED` | Must equal `true`: operator acknowledgement that the server is externally stopped |
 | Secret | `SERVER_SFTP_USERNAME` | SFTP account username |
 | Secret | `SERVER_SFTP_PASSWORD` | Password; set exactly one of password/private key |
 | Secret | `SERVER_SFTP_PRIVATE_KEY` | Unencrypted SSH private key, alternative to password |
 | Secret | `SERVER_SFTP_KNOWN_HOSTS` | OpenSSH known_hosts entry verified out of band with the host/provider; nonstandard ports use `[host]:port` |
+| Variable | `MODRINTH_SERVER_ID` | Existing Modrinth Hosting server refreshed after upload |
+| Secret | `MODRINTH_TOKEN` | Credential used by Rinth to refresh/start the Hosting runtime |
 
-**Stop and back up the server before enabling this path.** The stopped variable is
-an acknowledgement, not a remote power-state check. Unset it before restarting
-the server so later release events cannot upload to a running instance. No
-SSH command, loader installation, start, or restart is attempted. SFTP access
-alone does not imply access to a supported power API. Install matching Java,
-Minecraft and loader versions externally; materialization prints the release's
-runtime dependencies. A successful upload still requires an external start and
-health check. Do not use multiple controllers or modify files during upload.
+Enable RCON in `server.properties`, expose its allocated port, and configure the
+same password as `SERVER_RCON_PASSWORD`. The deploy helper authenticates, sends
+Minecraft's `stop` command, and requires two consecutive failed RCON probes before
+opening SFTP. Authentication failure is never interpreted as shutdown. It then
+promotes release-owned files atomically and invokes
+`rinth servers refresh-runtime <server-id>` to refresh/start the already configured
+Minecraft/loader runtime, then requires an authenticated RCON response before the
+job succeeds. Rinth is pinned to the reviewed commit containing that command. Do
+not run another deployment controller or modify server files during this sequence.
 
 The source is the single `.mrpack` attached to the exact GitHub Release, not the
 default branch or a fresh packwiz resolution. Release/chained triggers wait up to
