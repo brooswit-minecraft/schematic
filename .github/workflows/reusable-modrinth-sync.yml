@@ -36,25 +36,47 @@ jobs:
           PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
         run: |
-          status="$(curl -sS -o "$RUNNER_TEMP/patch-response" -w '%{http_code}' \
-            -X PATCH "https://api.modrinth.com/v2/project/$PROJECT_ID" \
-            -H "Authorization: $MODRINTH_TOKEN" \
-            -H 'Content-Type: application/json' \
-            -H 'User-Agent: brooswit-minecraft/schematic metadata-sync' \
-            --data-binary "@$RUNNER_TEMP/modrinth-project.json")"
-          if [ "$status" != 204 ]; then
-            cat "$RUNNER_TEMP/patch-response"
-            echo "::error::Modrinth metadata PATCH failed with HTTP $status"
-            exit 1
+          get_project() {
+            curl -fsSL "https://api.modrinth.com/v2/project/$PROJECT_ID" \
+              -H "Authorization: $MODRINTH_TOKEN" \
+              -H 'User-Agent: brooswit-minecraft/schematic metadata-sync'
+          }
+          get_project > "$RUNNER_TEMP/before.json"
+          jq -n --slurpfile want "$RUNNER_TEMP/modrinth-project.json" \
+            --slurpfile live "$RUNNER_TEMP/before.json" '
+              def same($key; $a; $b):
+                if ($key == "categories" or $key == "additional_categories")
+                then (($a // [] | sort) == ($b // [] | sort))
+                else $a == $b end;
+              $want[0] as $want | $live[0] as $live |
+              reduce ($want | keys[]) as $key ({};
+                if same($key; $want[$key]; $live[$key]) then .
+                else . + {($key): $want[$key]} end)
+            ' > "$RUNNER_TEMP/modrinth-patch.json"
+          if [ "$(jq 'length' "$RUNNER_TEMP/modrinth-patch.json")" -gt 0 ]; then
+            status="$(curl -sS -o "$RUNNER_TEMP/patch-response" -w '%{http_code}' \
+              -X PATCH "https://api.modrinth.com/v2/project/$PROJECT_ID" \
+              -H "Authorization: $MODRINTH_TOKEN" \
+              -H 'Content-Type: application/json' \
+              -H 'User-Agent: brooswit-minecraft/schematic metadata-sync' \
+              --data-binary "@$RUNNER_TEMP/modrinth-patch.json")"
+            if [ "$status" != 204 ]; then
+              cat "$RUNNER_TEMP/patch-response"
+              echo "::error::Modrinth metadata PATCH failed with HTTP $status"
+              exit 1
+            fi
+          else
+            echo 'Modrinth metadata is already current.'
           fi
-          curl -fsSL "https://api.modrinth.com/v2/project/$PROJECT_ID" \
-            -H "Authorization: $MODRINTH_TOKEN" \
-            -H 'User-Agent: brooswit-minecraft/schematic metadata-sync' \
-            > "$RUNNER_TEMP/readback.json"
+          get_project > "$RUNNER_TEMP/readback.json"
           jq -e -n --slurpfile want "$RUNNER_TEMP/modrinth-project.json" \
             --slurpfile live "$RUNNER_TEMP/readback.json" '
+              def same($key; $a; $b):
+                if ($key == "categories" or $key == "additional_categories")
+                then (($a // [] | sort) == ($b // [] | sort))
+                else $a == $b end;
               $want[0] as $want | $live[0] as $live |
-              all($want | keys[]; . as $key | $want[$key] == $live[$key])
+              all($want | keys[]; . as $key | same($key; $want[$key]; $live[$key]))
             ' >/dev/null || {
             echo '::error::Modrinth metadata read-back did not match the repository files'; exit 1;
           }
