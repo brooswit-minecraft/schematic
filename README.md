@@ -211,11 +211,11 @@ working unchanged, and switching is optional.
 
 The default route installs the just-published version through Modrinth Hosting's
 catalog API. A project awaiting moderation is absent from that catalog and must use
-the explicit `sftp` route described below. That route stops Minecraft over RCON,
-waits until the game/RCON endpoint is down, atomically uploads the exact `.mrpack`
-contents from the corresponding GitHub Release, then asks Rinth to refresh and start
-the existing Hosting runtime. Authentication, shutdown, asset, upload, and refresh
-errors are fatal, so a green deployment represents the whole lifecycle.
+the explicit `sftp` route described below. That route verifies the running server
+over RCON, atomically uploads the exact `.mrpack` contents from the corresponding
+GitHub Release, then asks Rinth to restart the existing Hosting runtime. The final
+gate requires RCON to go offline and return authenticated, so a green deployment
+represents the whole lifecycle.
 
 One-time setup:
 
@@ -420,15 +420,16 @@ Schematic `v1`, not the consumer's checkout.
 ## SFTP Live-Deployment Configuration
 
 Set these in the **consumer** repository. Missing RCON, SFTP, or Hosting refresh
-configuration is an error, not a successful skip. The workflow validates credentials
-before taking the game offline. No manual stopped-server acknowledgement is used.
+configuration is an error, not a successful skip. The workflow validates the live
+game and credentials before modifying files. No manual stopped-server acknowledgement
+is used.
 
 | Kind | Name | Contract |
 | --- | --- | --- |
 | Variable | `SERVER_DEPLOY_METHOD` | `sftp` to enable uploads; unset or `modrinth-api` keeps the existing path |
 | Variable | `SERVER_RCON_HOST` | Public hostname or address for the Minecraft server's RCON allocation |
 | Variable | `SERVER_RCON_PORT` | RCON port, default `25575` |
-| Variable | `SERVER_RCON_SHUTDOWN_TIMEOUT` | Seconds to wait for game/RCON shutdown, default `120`, maximum `600` |
+| Variable | `SERVER_RCON_SHUTDOWN_TIMEOUT` | Seconds to wait for each RCON restart phase, default `120`, maximum `600` |
 | Secret | `SERVER_RCON_PASSWORD` | Password matching `rcon.password` in `server.properties` |
 | Variable | `SERVER_SFTP_HOST` | Hosting provider's SFTP hostname |
 | Variable | `SERVER_SFTP_PORT` | SFTP port, default `22` |
@@ -441,14 +442,14 @@ before taking the game offline. No manual stopped-server acknowledgement is used
 | Secret | `MODRINTH_TOKEN` | Credential used by Rinth to refresh/start the Hosting runtime |
 
 Enable RCON in `server.properties`, expose its allocated port, and configure the
-same password as `SERVER_RCON_PASSWORD`. The deploy helper authenticates, sends
-Minecraft's `stop` command, and requires two consecutive failed RCON probes before
-opening SFTP. Authentication failure is never interpreted as shutdown. It then
-promotes release-owned files atomically and invokes
-`rinth servers refresh-runtime <server-id>` to refresh/start the already configured
-Minecraft/loader runtime, then requires an authenticated RCON response before the
-job succeeds. Rinth is pinned to the reviewed commit containing that command. Do
-not run another deployment controller or modify server files during this sequence.
+same password as `SERVER_RCON_PASSWORD`. The deploy helper first requires an
+authenticated RCON response, promotes release-owned files atomically, and invokes
+`rinth servers refresh-runtime <server-id>` while Hosting still considers the server
+running. Hosting owns the resulting stop/start lifecycle. The final gate must observe
+RCON become unavailable and then return an authenticated response before the job
+succeeds; an authentication failure is never interpreted as an outage. Rinth is
+pinned to the reviewed commit containing that command. Do not run another deployment
+controller or modify server files during this sequence.
 
 The source is the single `.mrpack` attached to the exact GitHub Release, not the
 default branch or a fresh packwiz resolution. Release/chained triggers wait up to
@@ -470,7 +471,7 @@ yourself; worlds and other unmanaged data are not deployment inputs. Pack paths
 containing hidden components are deliberately unsupported.
 
 A failed upload leaves `.schematic-deploy-pending` as a lock and may leave a
-`.schematic-stage-*` directory. Keep the server stopped, inspect or restore the
+`.schematic-stage-*` directory. Stop the server before inspecting or restoring the
 backup and manifest, then remove the marker/staging directory manually before
 retrying. Never clear the marker automatically after a partial promotion.
 Unknown host keys are rejected; do not replace verification with `ssh-keyscan`

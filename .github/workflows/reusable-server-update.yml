@@ -321,7 +321,7 @@ jobs:
           if [ "${#packs[@]}" -ne 1 ]; then echo '::error::Expected exactly one release pack'; exit 1; fi
           python .schematic-tools/scripts/server_deploy.py materialize \
             --archive "${packs[0]}" --version "${tag#v}" --output "$RUNNER_TEMP/server-files"
-      - name: Stop server and atomically upload verified files
+      - name: Verify running server and atomically upload files
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
           SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
@@ -335,19 +335,19 @@ jobs:
           SERVER_SFTP_PRIVATE_KEY: ${{ secrets.SERVER_SFTP_PRIVATE_KEY }}
           SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
         run: python .schematic-tools/scripts/server_deploy.py deploy --output "$RUNNER_TEMP/server-files"
-      - name: Start and refresh Modrinth Hosting runtime
+      - name: Restart through Modrinth Hosting runtime refresh
         env:
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
           SERVER_ID: ${{ vars.MODRINTH_SERVER_ID }}
         run: bunx --bun github:brooswit-minecraft/rinth#0e2c10e servers refresh-runtime "$SERVER_ID" --json
-      - name: Verify Minecraft is ready
+      - name: Verify Minecraft restarted and is ready
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
           SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
           SERVER_RCON_SHUTDOWN_TIMEOUT: ${{ vars.SERVER_RCON_SHUTDOWN_TIMEOUT }}
           SERVER_RCON_PASSWORD: ${{ secrets.SERVER_RCON_PASSWORD }}
-        run: python .schematic-tools/scripts/server_deploy.py wait-ready
+        run: python .schematic-tools/scripts/server_deploy.py wait-restarted
       - name: Report live deployment
         run: |
-          echo 'Exact release files uploaded and the Modrinth Hosting runtime refreshed.'
-          echo 'SFTP deployment complete: RCON shutdown, atomic upload, and Hosting runtime refresh succeeded.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Exact release files uploaded and the Modrinth Hosting runtime restarted.'
+          echo 'SFTP deployment complete: live preflight, atomic upload, and verified Hosting restart succeeded.' >> "$GITHUB_STEP_SUMMARY"

@@ -331,22 +331,49 @@ class DeploymentTest(unittest.TestCase):
         self.assertEqual(result, "online")
         self.assertEqual(calls, ["list", "list", "list"])
 
-    def test_deploy_stops_before_opening_sftp(self):
+    def test_wait_for_restart_observes_outage_then_readiness(self):
+        outcomes = iter(("still online", OSError("restarting"), OSError("starting"), "online"))
+        calls = []
+
+        def command(_host, _port, _password, operation, **_kwargs):
+            calls.append(operation)
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        config = {"SERVER_RCON_HOST": "server.invalid", "SERVER_RCON_PASSWORD": "secret"}
+        clock = iter((0, 0, 1, 2, 2, 3, 4))
+        result = deploy.wait_for_restart(config, command=command, sleep=lambda _: None,
+                                         monotonic=lambda: next(clock))
+        self.assertEqual(result, "online")
+        self.assertEqual(calls, ["list", "list", "list", "list"])
+
+    def test_wait_for_restart_rejects_auth_failure(self):
+        def command(*_args, **_kwargs):
+            raise deploy.RCONAuthError("bad password")
+
+        config = {"SERVER_RCON_HOST": "server.invalid", "SERVER_RCON_PASSWORD": "wrong"}
+        with self.assertRaises(deploy.RCONAuthError):
+            deploy.wait_for_restart(config, command=command, sleep=lambda _: None,
+                                    monotonic=lambda: 0)
+
+    def test_deploy_verifies_readiness_before_opening_sftp(self):
         order = []
         config = {key: "test" for key in ("SERVER_RCON_HOST", "SERVER_RCON_PASSWORD",
                                             "SERVER_SFTP_HOST", "SERVER_SFTP_USERNAME",
                                             "SERVER_SFTP_PATH", "SERVER_SFTP_KNOWN_HOSTS")}
         config["SERVER_SFTP_PASSWORD"] = "secret"
-        with mock.patch.object(deploy, "stop_and_wait", side_effect=lambda _env: order.append("stop")), \
+        with mock.patch.object(deploy, "wait_until_ready", side_effect=lambda _env: order.append("ready")), \
              mock.patch.object(deploy, "connect_upload", side_effect=lambda _output, _env: order.append("upload")):
             deploy.deploy("output", config)
-        self.assertEqual(order, ["stop", "upload"])
+        self.assertEqual(order, ["ready", "upload"])
 
-    def test_deploy_validates_all_configuration_before_stop(self):
-        with mock.patch.object(deploy, "stop_and_wait") as stop:
+    def test_deploy_validates_all_configuration_before_readiness_probe(self):
+        with mock.patch.object(deploy, "wait_until_ready") as ready:
             with self.assertRaises(ValueError):
                 deploy.deploy("output", {"SERVER_RCON_HOST": "host", "SERVER_RCON_PASSWORD": "secret"})
-        stop.assert_not_called()
+        ready.assert_not_called()
 
     def test_configuration_requires_rcon_sftp_and_one_credential(self):
         config = {key: "test" for key in ("SERVER_SFTP_HOST", "SERVER_SFTP_USERNAME", "SERVER_SFTP_PATH", "SERVER_SFTP_KNOWN_HOSTS")}

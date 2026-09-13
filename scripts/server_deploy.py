@@ -132,6 +132,20 @@ def wait_until_ready(env, command=rcon_command, sleep=time.sleep, monotonic=time
     raise TimeoutError("Minecraft RCON did not become ready after runtime refresh")
 
 
+def wait_for_restart(env, command=rcon_command, sleep=time.sleep, monotonic=time.monotonic):
+    host, port, password, restart_timeout = rcon_config(env)
+    deadline = monotonic() + restart_timeout
+    while monotonic() < deadline:
+        try:
+            command(host, port, password, "list", timeout=5)
+            sleep(1)
+        except RCONAuthError:
+            raise
+        except (OSError, EOFError, TimeoutError):
+            return wait_until_ready(env, command=command, sleep=sleep, monotonic=monotonic)
+    raise TimeoutError("Minecraft RCON never went offline for the managed restart")
+
+
 def safe_path(value):
     if not isinstance(value, str) or not value or "\\" in value or ":" in value:
         raise ValueError("Invalid pack path")
@@ -431,17 +445,18 @@ def connect_upload(output, env=os.environ):
 
 
 def deploy(output, env=os.environ):
-    # Validate every credential before taking a running server offline.
+    # The v1 runtime refresh preserves a running server's power state. Keep it
+    # running while atomically replacing pack-owned files, then let Hosting own
+    # the stop/start lifecycle in the next workflow step.
     rcon_config(env)
     upload_config(env)
-    # Do not open SFTP until the game has actually released its files.
-    stop_and_wait(env)
+    wait_until_ready(env)
     connect_upload(output, env)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("materialize", "deploy", "wait-ready"))
+    parser.add_argument("command", choices=("materialize", "deploy", "wait-ready", "wait-restarted"))
     parser.add_argument("--output")
     parser.add_argument("--archive")
     parser.add_argument("--version")
@@ -457,9 +472,11 @@ def main():
             if not args.output:
                 parser.error("deploy requires --output")
             deploy(args.output)
-            print("Server stopped and exact release files uploaded atomically.")
-        else:
+            print("Running server verified and exact release files uploaded atomically.")
+        elif args.command == "wait-ready":
             print(wait_until_ready(os.environ))
+        else:
+            print(wait_for_restart(os.environ))
     except Exception as error:
         # SSH/network exceptions may contain credentials, URLs or host details.
         print("Deployment failed (" + type(error).__name__ + "). Check RCON/SFTP configuration, pack integrity, remote ownership and pending marker.", file=sys.stderr)
