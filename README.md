@@ -194,7 +194,7 @@ This builds and uploads the `.mrpack` as a workflow artifact but skips the
 Release-asset step (there is no Release object to attach to). **A plain `workflow_dispatch`
 run (no `publish: true`, see below) never publishes to Modrinth, even when
 `MODRINTH_TOKEN` and `MODRINTH_PROJECT_ID` are both configured** — the Modrinth publish
-only runs on the `release` event, or when `publish: true` is set. If Modrinth is
+only runs on `push` or `release`, or when `publish: true` is set. If Modrinth is
 configured, a dry run still validates the payload it *would* send via
 `rinth publish --dry-run` — project, file, version, channel, game version and loaders —
 without ever calling the Modrinth API, so a dry run catches a bad target (e.g. a
@@ -259,9 +259,8 @@ setting in your normal `release.yml` stub.** `release.yml`'s own `on:` also incl
 `release`, and the overwrite guard runs whenever `push` **or** `publish: true` is true.
 If `publish: true` were set unconditionally there, **every** `release`-triggered run
 would hit the guard and fail, because the release that triggered the run already exists
-— the guard would refuse to overwrite it. This repo ships to two products by moving the
-`v1` tag, so a footgun in this example is a footgun in production; keep `publish: true`
-scoped to the automated caller that actually needs it.
+— the guard would refuse to overwrite it. Every consumer shares this same `@v1`, so keep
+`publish: true` scoped to the automated caller that actually needs it.
 
 ## Deploying to a Modrinth Server
 
