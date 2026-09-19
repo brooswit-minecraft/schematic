@@ -2,10 +2,18 @@ name: Reusable Release
 
 # Callable from a consumer's thin release.yml stub. Builds the .mrpack,
 # attaches it to a GitHub Release, and publishes to Modrinth when configured.
-# A pack-changing push to main creates the release from pack.toml. The legacy
-# release event remains supported; workflow_dispatch remains a dry run.
+# A pack-changing push to main creates the release from pack.toml, and the
+# legacy release event remains supported; workflow_dispatch remains a dry
+# run by default. Two optional inputs extend this for an automated caller
+# that can't push or open a GitHub Release itself: `publish` (default false)
+# opts a call into the same publish behaviour as a push, and `ref` (default
+# '') checks out and releases a specific commit instead of the caller's own
+# triggering ref. See the `on.workflow_call.inputs` block below for exact
+# semantics, and the comment above the "Compute publish decision" step for
+# the two gating predicates (P1/P2) everything downstream keys on.
 # actions/checkout below checks out whichever repo invoked this workflow,
-# not this one.
+# not this one — unless `ref` is set, in which case it checks out that ref
+# instead of the caller's own triggering ref.
 #
 # `github.event_name` / `github.event.release.*` here reflect the CALLER's
 # original triggering event, not a synthetic "workflow_call" event — verified
@@ -24,6 +32,28 @@ on:
           directly for that case.
         required: false
         type: string
+      ref:
+        description: >-
+          Ref to check out and build from, e.g. a commit SHA an automated
+          caller just pushed. When set, actions/checkout below checks out
+          this ref instead of the caller's own triggering ref, and the
+          GitHub release's target_commitish is the resolved SHA of that
+          checkout rather than github.sha. Leave empty (the default) for
+          behaviour that is byte-for-byte what it is today.
+        required: false
+        type: string
+      publish:
+        description: >-
+          When true, this run publishes exactly like a push-triggered run:
+          the refuse-to-overwrite guard runs before the build, the GitHub
+          release is created with generated release notes, and the Modrinth
+          publish runs (if configured). Meant for an automated caller (e.g.
+          repository_dispatch) that can't otherwise reach the release/push
+          paths. Leave false (the default) for behaviour that is
+          byte-for-byte what it is today.
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   release:
@@ -31,6 +61,65 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # actions/checkout treats an empty `ref:` (the default above) as "not
+      # set" and falls back to the caller's own triggering ref/SHA, so this
+      # step's output differs from github.sha only when `inputs.ref` was
+      # actually given. checkout@v4 doesn't output the resolved SHA itself,
+      # so we record it ourselves. Cheap, local, no secrets — runs
+      # unconditionally rather than only when `inputs.ref` is set, since a
+      # conditional here would buy nothing and only add a branch to read.
+      - name: Resolve checkout SHA
+        id: checkout_sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # The two predicates everything below keys on (SCHEM-28/SCHEM-30):
+      #
+      #   P1 = release || push || inputs.publish
+      #     The observable "should this run publish at all?" decision.
+      #     Gates the release-attach step and the Modrinth-publish step
+      #     (the latter ANDed with has_modrinth, as today). Written to
+      #     $GITHUB_OUTPUT and echoed to $GITHUB_STEP_SUMMARY so a typo'd
+      #     condition is visible even when Modrinth is unconfigured and the
+      #     Modrinth step would skip either way.
+      #
+      #   P2 = push || inputs.publish
+      #     Gates the refuse-to-overwrite guard and generate_release_notes.
+      #     Deliberately excludes `release`: on a release event the release
+      #     already exists (that's what triggered the run), so keying the
+      #     guard on P1 would fail every legacy release-path run — the
+      #     guard would `exit 1` before the build even starts. Generated
+      #     notes stay off on `release` for the same reason: the notes
+      #     there are the human-authored release body, and switching to
+      #     generated notes there would be a behaviour change, not a fix.
+      #
+      # Both inputs reach the shell only via env:, per this file's existing
+      # convention (see "Resolve version" below) — never interpolated
+      # directly into the run: body.
+      - name: Compute publish decision
+        id: decision
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [ "$EVENT_NAME" = release ] || [ "$EVENT_NAME" = push ] || [ "$INPUT_PUBLISH" = true ]; then
+            p1=true
+          else
+            p1=false
+          fi
+          if [ "$EVENT_NAME" = push ] || [ "$INPUT_PUBLISH" = true ]; then
+            p2=true
+          else
+            p2=false
+          fi
+          echo "publish=$p1" >> "$GITHUB_OUTPUT"
+          echo "guard=$p2" >> "$GITHUB_OUTPUT"
+          {
+            echo "P1 (release-attach / Modrinth-publish gate) = $p1"
+            echo "P2 (overwrite-guard / generate_release_notes gate) = $p2"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Values reach the shell only through env: (data), never interpolated
       # directly into the script (code) — a tag/input containing quotes or
@@ -57,7 +146,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Refuse to overwrite an existing automatic release
-        if: github.event_name == 'push'
+        if: steps.decision.outputs.guard == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.ver.outputs.version }}
@@ -104,13 +193,15 @@ jobs:
           if-no-files-found: error
 
       - name: Attach .mrpack to the GitHub Release
-        if: github.event_name == 'release' || github.event_name == 'push'
+        if: steps.decision.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           name: ${{ steps.pack.outputs.name }} v${{ steps.ver.outputs.version }}
-          target_commitish: ${{ github.sha }}
-          generate_release_notes: ${{ github.event_name == 'push' }}
+          # Unchanged (github.sha) on the default path — only an explicit
+          # `ref` input routes this through the resolved-checkout SHA above.
+          target_commitish: ${{ inputs.ref != '' && steps.checkout_sha.outputs.sha || github.sha }}
+          generate_release_notes: ${{ steps.decision.outputs.guard }}
           files: build/*.mrpack
 
       # Secrets can't be referenced directly in `if:`, so map them into env
@@ -142,7 +233,7 @@ jobs:
       # whenever Modrinth is configured, on both the release path and the
       # workflow_dispatch path — the dispatch path's dry-run invocation below
       # needs real values to print. Only the actual publish step stays gated
-      # to the `release` event.
+      # to P1.
       - name: Resolve Modrinth targets
         if: steps.modrinth_check.outputs.has_modrinth == 'true'
         id: targets
@@ -180,7 +271,9 @@ jobs:
       # 36-38) — GitHub substitutes a value into run: textually before the
       # shell runs it, so a body containing $(...) or a quote must not reach
       # the shell of a job with contents: write. This also gets multi-line
-      # bodies (the normal case) to rinth cleanly via --changelog-file.
+      # bodies (the normal case) to rinth cleanly via --changelog-file. Only
+      # a `release` event has a human-authored body; a `publish: true` run
+      # that isn't itself a release event gets an empty changelog file here.
       - name: Write Modrinth changelog to file
         if: steps.modrinth_check.outputs.has_modrinth == 'true'
         id: changelog
@@ -202,14 +295,19 @@ jobs:
       # ctx.transport, so this cannot make a network call (verified against
       # rinth's source at v0.8.0). This is a SECOND belt, not a replacement
       # for the `if:` on the "Publish to Modrinth" step below — that `if:`,
-      # keyed on github.event_name == 'release', is what actually prevents a
-      # workflow_dispatch run from ever publishing. Two separate steps with
-      # mutually exclusive event conditions, deliberately not one step whose
-      # --dry-run flag is computed from an expression — collapsing them would
-      # make a string interpolation the only thing standing between a
-      # dispatch run and a live publish.
+      # keyed on P1, is what actually prevents a dispatch run from ever
+      # publishing. Two separate steps with mutually exclusive `if:`
+      # conditions, deliberately not one step whose --dry-run flag is
+      # computed from an expression — collapsing them would make a string
+      # interpolation the only thing standing between a dispatch run and a
+      # live publish. Requiring P1 == 'false' here (rather than just
+      # `github.event_name == 'workflow_dispatch'`) is what keeps this step
+      # and the publish step below mutually exclusive now that a
+      # workflow_dispatch caller can also set `publish: true`: without it,
+      # a workflow_dispatch run with publish: true would run both this dry
+      # run AND the real publish in the same job.
       - name: Dry-run Modrinth publish
-        if: steps.modrinth_check.outputs.has_modrinth == 'true' && github.event_name == 'workflow_dispatch'
+        if: steps.modrinth_check.outputs.has_modrinth == 'true' && github.event_name == 'workflow_dispatch' && steps.decision.outputs.publish == 'false'
         env:
           PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
           MRPACK_FILE: ${{ steps.mrpack.outputs.file }}
@@ -239,7 +337,7 @@ jobs:
       # publish a duplicate version_number (exits 5) before any upload — a
       # behaviour change from before, called out in the PR description.
       - name: Publish to Modrinth
-        if: steps.modrinth_check.outputs.has_modrinth == 'true' && (github.event_name == 'release' || github.event_name == 'push')
+        if: steps.modrinth_check.outputs.has_modrinth == 'true' && steps.decision.outputs.publish == 'true'
         env:
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
           PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
