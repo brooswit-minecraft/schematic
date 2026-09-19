@@ -191,13 +191,76 @@ gh workflow run release.yml --ref <branch> -f version=0.0.1-test
 ```
 
 This builds and uploads the `.mrpack` as a workflow artifact but skips the
-Release-asset step (there is no Release object to attach to). **A `workflow_dispatch`
-run never publishes to Modrinth, even when `MODRINTH_TOKEN` and `MODRINTH_PROJECT_ID`
-are both configured** — the Modrinth publish only ever runs on the `release` event.
-If Modrinth is configured, a dispatch run still validates the payload it *would* send
-via `rinth publish --dry-run` — project, file, version, channel, game version and
-loaders — without ever calling the Modrinth API, so a dry run catches a bad target
-(e.g. a mistyped loader) before a real release does.
+Release-asset step (there is no Release object to attach to). **A plain `workflow_dispatch`
+run (no `publish: true`, see below) never publishes to Modrinth, even when
+`MODRINTH_TOKEN` and `MODRINTH_PROJECT_ID` are both configured** — the Modrinth publish
+only runs on `push` or `release`, or when `publish: true` is set. If Modrinth is
+configured, a dry run still validates the payload it *would* send via
+`rinth publish --dry-run` — project, file, version, channel, game version and loaders —
+without ever calling the Modrinth API, so a dry run catches a bad target (e.g. a
+mistyped loader) before a real release does.
+
+### Releasing from an automated workflow with `GITHUB_TOKEN`
+
+`push` and `release` cover a human cutting a release. Neither works for an *automated*
+caller — say, a `repository_dispatch`-triggered workflow that just committed a version
+bump and wants to release that exact commit: `repository_dispatch` isn't `push` or
+`release`, so nothing would publish, and even if it were, `github.sha` on that run is the
+commit *before* the bump. Pushing the bump to let `release.yml` fire on its own `push`
+trigger doesn't work either — GitHub does not start workflow runs from a push made with
+the default `GITHUB_TOKEN`.
+
+Two `workflow_call` inputs on `reusable-release.yml` exist for exactly this case, and
+both default to today's behaviour when left unset:
+
+| Input | Type | Default | Effect |
+|---|---|---|---|
+| `ref` | string | `''` | Checks out this ref/SHA instead of the caller's own triggering ref, and the GitHub release's `target_commitish` becomes the **resolved SHA of that checkout** rather than `github.sha`. Leave empty for unchanged behaviour. |
+| `publish` | boolean | `false` | When `true`, the run publishes exactly like a `push`-triggered run: the refuse-to-overwrite guard runs before the build, the GitHub release is created with generated release notes, and the Modrinth publish runs (if configured). Leave `false` for unchanged behaviour. |
+
+A caller that commits its own bump and wants to release it passes both, from a job with
+`contents: write` (permissions live in the **caller's** job, not in the reusable
+workflow):
+
+```yaml
+name: Auto-bump release
+
+on:
+  repository_dispatch:
+    types: [bump]
+
+permissions:
+  contents: write
+
+jobs:
+  bump-and-release:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.bump.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      # ...bump pack.toml, commit, and push here...
+      - id: bump
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: bump-and-release
+    permissions:
+      contents: write
+    uses: brooswit-minecraft/schematic/.github/workflows/reusable-release.yml@v1
+    with:
+      publish: true
+      ref: ${{ needs.bump-and-release.outputs.sha }}
+    secrets: inherit
+```
+
+**Pass `publish: true` from a caller like this one specifically — never as a blanket
+setting in your normal `release.yml` stub.** `release.yml`'s own `on:` also includes
+`release`, and the overwrite guard runs whenever `push` **or** `publish: true` is true.
+If `publish: true` were set unconditionally there, **every** `release`-triggered run
+would hit the guard and fail, because the release that triggered the run already exists
+— the guard would refuse to overwrite it. Every consumer shares this same `@v1`, so keep
+`publish: true` scoped to the automated caller that actually needs it.
 
 ## Deploying to a Modrinth Server
 
