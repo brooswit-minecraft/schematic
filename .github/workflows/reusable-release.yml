@@ -384,6 +384,19 @@ jobs:
           fi
           echo "file=$file" >> "$GITHUB_OUTPUT"
 
+      # TEMPORARY — SCHEM-35 evidence probe, NOT part of the shipped PR.
+      # Removed before merge. Exists only to make the Modrinth changelog
+      # file's content visible in a run log without a real Modrinth
+      # project (see the ticket's "Known trap" section on why has_modrinth
+      # alone can't otherwise prove notes-file reached the changelog).
+      - name: SCHEM-35 TEMP - show changelog file
+        if: steps.modrinth_check.outputs.has_modrinth == 'true'
+        run: |
+          echo "sha256: $(sha256sum "${{ steps.changelog.outputs.file }}")"
+          echo "--- changelog file content, literal, below this line ---"
+          cat "${{ steps.changelog.outputs.file }}"
+          echo "--- end changelog file content ---"
+
       - uses: oven-sh/setup-bun@v2
         if: steps.modrinth_check.outputs.has_modrinth == 'true'
 
