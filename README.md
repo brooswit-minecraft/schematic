@@ -289,8 +289,14 @@ When set on the `push`/`publish: true` path, the file's contents become **both**
   notes first, generated notes after — the file's text is unmodified, GitHub's own
   `generate_release_notes` behaviour just appends after whatever `body`/`body_path` it's
   given);
-- the Modrinth changelog for that same release — the exact same file, byte-for-byte, on
-  both the `workflow_dispatch` dry run and the real publish.
+- the Modrinth changelog for that release. A plain `workflow_dispatch` run *without*
+  `publish: true` is a dry run in the `push`/`publish: true` sense too: `notes-file` is
+  neither read nor validated there (its changelog stays empty, exactly as before this
+  input existed), since the same `push || publish: true` gate governs `notes-file` as
+  governs the overwrite guard and generated notes above. A `publish: true` run — whether
+  triggered by `push` or by `workflow_dispatch` — does read the file, for both the
+  GitHub release body and the Modrinth changelog. Nothing here previews the changelog
+  without actually publishing.
 
 **A caller that only conditionally has notes to pass** (e.g. a step that produces a
 notes file solely for a breaking change) can wire `notes-file` straight from that step's
