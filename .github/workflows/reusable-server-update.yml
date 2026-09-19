@@ -17,8 +17,8 @@ name: Reusable Server update
 # forwards `event_name = "workflow_run"` and `github.event.workflow_run.*`
 # from ITS OWN trigger, not a synthetic value from this reusable workflow.
 #
-# Three ways a caller can reach this workflow, and this file must keep all
-# three working forever (see the stub migration note in README.md):
+# Three NAMED ways a caller can reach this workflow, and this file must keep
+# all three working forever (see the stub migration note in README.md):
 #   - release        the legacy direct trigger (`release: published`) races
 #                     reusable-release.yml on the same event, still used by
 #                     any consumer whose stub hasn't migrated to chaining.
@@ -26,7 +26,19 @@ name: Reusable Server update
 #                     repo's "Release" workflow run completes, so there is no
 #                     race — see the stub in this repo's own server-update.yml.
 #   - workflow_dispatch  the manual re-point path, unrelated to either
-#                     trigger above.
+#                     trigger above: the version is expected to already exist,
+#                     so this path fails fast (see "Resolve published version
+#                     id" and "Download exact release pack" below) and must
+#                     keep doing so.
+# A FOURTH, unnamed shape also reaches this workflow: an automated caller
+# (e.g. a repository_dispatch-triggered auto-bump, SCHEM-29) that calls this
+# workflow directly, right after it published a release itself, with neither
+# a release/workflow_run/workflow_dispatch event of its own. That caller
+# lands in the catch-all `else`/`*` branches below alongside any other event
+# name nobody has named yet — SCHEM-29 made those branches behave like an
+# automated post-publish caller (wait enabled, ref respected) rather than
+# like workflow_dispatch, which is why the gating below is keyed on
+# excluding workflow_dispatch specifically, not on naming this fourth shape.
 
 on:
   workflow_call:
@@ -40,6 +52,20 @@ on:
           github.event.workflow_run.head_branch (which, for a run triggered
           by a published release, is the release tag — see "Resolve version"
           below). Falls back to pack.toml only if none of those apply.
+        required: false
+        type: string
+      ref:
+        description: >-
+          Ref to check out, e.g. a commit SHA an automated caller just
+          released. Applied to actions/checkout in both jobs below — the
+          deploy job's own checkout, and the sftp job's FIRST checkout of the
+          caller's repo (not its second checkout of this repo pinned at v1
+          for deploy scripts, which builds the supervisor/RCON tooling and
+          has no dependency on the caller's release ref). Also determines
+          what commit the pack.toml fallback reads when `version` is not
+          given. Leave empty (the default) for behaviour that is
+          byte-for-byte what it is today, matching reusable-release.yml's
+          `ref` input.
         required: false
         type: string
 
@@ -63,6 +89,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       # github.event.release.tag_name, github.event.workflow_run.head_branch,
       # and inputs.version are all attacker-influenced (a release tag, a
@@ -159,6 +187,19 @@ jobs:
       # attempt, i.e. fail fast. Exhausting the budget without a match is a
       # real error worth failing loudly for, not a skip.
       #
+      # SCHEM-29: an automated caller (e.g. a repository_dispatch-triggered
+      # auto-bump) that calls this workflow directly right after publishing a
+      # release has neither event_name release/workflow_run/workflow_dispatch
+      # of its own — it lands in the `else` below. It needs the SAME
+      # publish-to-visibility tolerance as `release`/`workflow_run`, for the
+      # same reason: it just published and Modrinth may not have indexed the
+      # version yet. So the wait is enabled for every event EXCEPT
+      # workflow_dispatch specifically, rather than only for the two named
+      # events — `workflow_dispatch` is excluded by name (not by "version is
+      # empty") because it, uniquely, also passes `version` explicitly for a
+      # manual re-point where the version is expected to already exist, and
+      # must keep failing fast.
+      #
       # rinth distinguishes a draft/unreadable project (exit 4,
       # project_unreadable) from "project readable, no matching version"
       # (exit 7 no_version_match, or exit 8 wait_exhausted once a --wait
@@ -175,10 +216,10 @@ jobs:
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "$EVENT_NAME" = "release" ] || [ "$EVENT_NAME" = "workflow_run" ]; then
-            wait_args=(--wait 300 --wait-interval 15)
-          else
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             wait_args=()
+          else
+            wait_args=(--wait 300 --wait-interval 15)
           fi
 
           set +e
@@ -210,10 +251,10 @@ jobs:
               echo "::error::No Modrinth version found for project ${PROJECT_ID} with version_number ${VERSION} after the ~300s (20-attempt) budget — has this release been published to Modrinth yet?"
               ;;
             7)
-              if [ "$EVENT_NAME" = "release" ] || [ "$EVENT_NAME" = "workflow_run" ]; then
-                echo "::error::No Modrinth version found for project ${PROJECT_ID} with version_number ${VERSION} after the ~300s (20-attempt) budget — has this release been published to Modrinth yet?"
-              else
+              if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
                 echo "::error::No Modrinth version found for project ${PROJECT_ID} with version_number ${VERSION} — has this release been published to Modrinth yet?"
+              else
+                echo "::error::No Modrinth version found for project ${PROJECT_ID} with version_number ${VERSION} after the ~300s (20-attempt) budget — has this release been published to Modrinth yet?"
               fi
               ;;
             *)
@@ -253,6 +294,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
       # A reusable workflow checks out its caller, which may not have these
       # scripts. Fetch the implementation from the same upstream release line.
@@ -305,8 +347,13 @@ jobs:
             echo '::error::Invalid release tag'; exit 1
           fi
           mkdir -p "$RUNNER_TEMP/server-release"
+          # SCHEM-29: mirrors the modrinth-api job's wait gating below — every
+          # event except workflow_dispatch (a manual re-point, where the
+          # release is expected to already exist) gets the same
+          # publish-to-availability tolerance as release/workflow_run,
+          # including an automated direct caller that just published.
           attempts=1
-          if [ "$EVENT_NAME" = release ] || [ "$EVENT_NAME" = workflow_run ]; then attempts=21; fi
+          if [ "$EVENT_NAME" != workflow_dispatch ]; then attempts=21; fi
           for ((i=1; i<=attempts; i++)); do
             # Fail API/auth errors immediately; only absent release assets wait.
             metadata="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets)"
