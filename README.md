@@ -210,13 +210,14 @@ commit *before* the bump. Pushing the bump to let `release.yml` fire on its own 
 trigger doesn't work either — GitHub does not start workflow runs from a push made with
 the default `GITHUB_TOKEN`.
 
-Two `workflow_call` inputs on `reusable-release.yml` exist for exactly this case, and
-both default to today's behaviour when left unset:
+Three `workflow_call` inputs on `reusable-release.yml` exist for exactly this case, and
+all default to today's behaviour when left unset:
 
 | Input | Type | Default | Effect |
 |---|---|---|---|
 | `ref` | string | `''` | Checks out this ref/SHA instead of the caller's own triggering ref, and the GitHub release's `target_commitish` becomes the **resolved SHA of that checkout** rather than `github.sha`. Leave empty for unchanged behaviour. |
 | `publish` | boolean | `false` | When `true`, the run publishes exactly like a `push`-triggered run: the refuse-to-overwrite guard runs before the build, the GitHub release is created with generated release notes, and the Modrinth publish runs (if configured). Leave `false` for unchanged behaviour. |
+| `notes-file` | string | `''` | Repo-relative path to a file (read at the checked-out `ref`) whose contents become the GitHub release body and the Modrinth changelog on the `push`/`publish: true` path. See [Authoring release notes for an automated release](#authoring-release-notes-for-an-automated-release) below. Leave empty for unchanged behaviour. |
 
 A caller that commits its own bump and wants to release it passes both, from a job with
 `contents: write` (permissions live in the **caller's** job, not in the reusable
@@ -261,6 +262,63 @@ If `publish: true` were set unconditionally there, **every** `release`-triggered
 would hit the guard and fail, because the release that triggered the run already exists
 — the guard would refuse to overwrite it. Every consumer shares this same `@v1`, so keep
 `publish: true` scoped to the automated caller that actually needs it.
+
+### Authoring release notes for an automated release
+
+By default, a `push` or `publish: true` run has no authored notes to draw on — only the
+GitHub-generated ones (`generate_release_notes: true`, unchanged). `notes-file` lets a
+caller supply real, authored notes (a `## Migration` section for a breaking change,
+say) on that same path, without needing a human to open a GitHub Release:
+
+```yaml
+  release:
+    needs: bump-and-release
+    permissions:
+      contents: write
+    uses: brooswit-minecraft/schematic/.github/workflows/reusable-release.yml@v1
+    with:
+      publish: true
+      ref: ${{ needs.bump-and-release.outputs.sha }}
+      notes-file: CHANGELOG.md
+    secrets: inherit
+```
+
+When set on the `push`/`publish: true` path, the file's contents become **both**:
+
+- the GitHub release body, with the generated notes still appended after (authored
+  notes first, generated notes after — the file's text is unmodified, GitHub's own
+  `generate_release_notes` behaviour just appends after whatever `body`/`body_path` it's
+  given);
+- the Modrinth changelog for that release. A plain `workflow_dispatch` run *without*
+  `publish: true` is a dry run in the `push`/`publish: true` sense too: `notes-file` is
+  neither read nor validated there (its changelog stays empty, exactly as before this
+  input existed), since the same `push || publish: true` gate governs `notes-file` as
+  governs the overwrite guard and generated notes above. A `publish: true` run — whether
+  triggered by `push` or by `workflow_dispatch` — does read the file, for both the
+  GitHub release body and the Modrinth changelog. Nothing here previews the changelog
+  without actually publishing.
+
+**A caller that only conditionally has notes to pass** (e.g. a step that produces a
+notes file solely for a breaking change) can wire `notes-file` straight from that step's
+output — an empty output is silent and behaves exactly like leaving `notes-file` unset,
+not an error:
+
+```yaml
+    with:
+      publish: true
+      ref: ${{ needs.bump-and-release.outputs.sha }}
+      notes-file: ${{ steps.maybe-write-notes.outputs.path }}
+```
+
+**On a `release` event, `notes-file` is ignored entirely** — not read, not validated,
+never fails the run. The human-authored GitHub Release body remains the only source for
+both the release and the Modrinth changelog there, exactly as before this input existed.
+
+**A non-empty `notes-file` that isn't usable fails the run loudly**, before
+`actions/setup-go` and before anything is built or published: the path is missing, is a
+directory, is an empty file, or resolves outside the checkout (via `../`, an absolute
+path, or a symlink) — the "Validate notes-file" step's `::error::` message says which.
+This check runs whether or not Modrinth is configured for the caller.
 
 ## Deploying to a Modrinth Server
 

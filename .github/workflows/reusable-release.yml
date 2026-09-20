@@ -4,13 +4,17 @@ name: Reusable Release
 # attaches it to a GitHub Release, and publishes to Modrinth when configured.
 # A pack-changing push to main creates the release from pack.toml, and the
 # legacy release event remains supported; workflow_dispatch remains a dry
-# run by default. Two optional inputs extend this for an automated caller
+# run by default. Three optional inputs extend this for an automated caller
 # that can't push or open a GitHub Release itself: `publish` (default false)
-# opts a call into the same publish behaviour as a push, and `ref` (default
-# '') checks out and releases a specific commit instead of the caller's own
-# triggering ref. See the `on.workflow_call.inputs` block below for exact
-# semantics, and the comment above the "Compute publish decision" step for
-# the two gating predicates (P1/P2) everything downstream keys on.
+# opts a call into the same publish behaviour as a push, `ref` (default '')
+# checks out and releases a specific commit instead of the caller's own
+# triggering ref, and `notes-file` (default '') names a repo-relative file
+# whose contents become the GitHub release body and the Modrinth changelog
+# on the push/`publish: true` path — see the "Validate notes-file" step and
+# its own input description below for exact semantics. See the
+# `on.workflow_call.inputs` block below for exact semantics, and the comment
+# above the "Compute publish decision" step for the two gating predicates
+# (P1/P2) everything downstream keys on.
 # actions/checkout below checks out whichever repo invoked this workflow,
 # not this one — unless `ref` is set, in which case it checks out that ref
 # instead of the caller's own triggering ref.
@@ -54,6 +58,22 @@ on:
         required: false
         type: boolean
         default: false
+      notes-file:
+        description: >-
+          Repo-relative path to a file, read at the checked-out ref (so it
+          composes with `ref` above), whose contents become the GitHub
+          release body (with generated notes still appended after, exactly
+          as today) and the Modrinth changelog — but only on the P2 path
+          (push or `publish: true`). Ignored entirely on a `release` event:
+          the human-authored release body remains the source there, and the
+          file is not read or validated in that case. Leave empty (the
+          default, or any expression that evaluates to empty) for behaviour
+          that is byte-for-byte what it is today. A non-empty value on the
+          P2 path that doesn't resolve to a real, non-empty, in-checkout
+          file fails the run loudly before the build or any publish step.
+        required: false
+        type: string
+        default: ''
 
 jobs:
   release:
@@ -120,6 +140,50 @@ jobs:
             echo "P1 (release-attach / Modrinth-publish gate) = $p1"
             echo "P2 (overwrite-guard / generate_release_notes gate) = $p2"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # notes-file is validated only on the P2 path (push || inputs.publish)
+      # and only when non-empty — never on `release` (see the P2 comment
+      # above: that event keeps the human-authored release body as its only
+      # source, so notes-file is neither read nor validated there), and
+      # never when unset (an empty/unset notes-file is a documented no-op,
+      # not an error). This runs before actions/setup-go and before any
+      # publish step, so a bad path fails the run loudly with nothing built
+      # or published — deliberately independent of has_modrinth, since bad
+      # input must fail even for a caller with no Modrinth token configured.
+      # The input reaches the shell only through env:, per this file's
+      # convention; the resolved path is used only as a `realpath`/test
+      # argument and a `cp` source later, never interpolated into a script.
+      - name: Validate notes-file
+        if: steps.decision.outputs.guard == 'true' && inputs['notes-file'] != ''
+        env:
+          NOTES_FILE: ${{ inputs['notes-file'] }}
+        run: |
+          case "$NOTES_FILE" in
+            /*)
+              echo "::error::notes-file must be a repo-relative path, got an absolute path: '$NOTES_FILE'"
+              exit 1
+              ;;
+          esac
+          workspace="$(realpath -e -- "$GITHUB_WORKSPACE")"
+          if ! resolved="$(realpath -e -- "$NOTES_FILE" 2>/dev/null)"; then
+            echo "::error::notes-file '$NOTES_FILE' does not exist"
+            exit 1
+          fi
+          case "$resolved" in
+            "$workspace"/*|"$workspace") : ;;
+            *)
+              echo "::error::notes-file '$NOTES_FILE' resolves outside the checkout (resolved: $resolved)"
+              exit 1
+              ;;
+          esac
+          if [ -d "$resolved" ]; then
+            echo "::error::notes-file '$NOTES_FILE' is a directory, not a file"
+            exit 1
+          fi
+          if [ ! -s "$resolved" ]; then
+            echo "::error::notes-file '$NOTES_FILE' is empty"
+            exit 1
+          fi
 
       # Values reach the shell only through env: (data), never interpolated
       # directly into the script (code) — a tag/input containing quotes or
@@ -202,6 +266,27 @@ jobs:
           # `ref` input routes this through the resolved-checkout SHA above.
           target_commitish: ${{ inputs.ref != '' && steps.checkout_sha.outputs.sha || github.sha }}
           generate_release_notes: ${{ steps.decision.outputs.guard }}
+          # notes-file only applies on the P2 path (push || inputs.publish);
+          # gating on steps.decision.outputs.guard here (not just checking
+          # inputs['notes-file'] directly) is what keeps a `release` event's
+          # release body untouched even if a caller passed notes-file on
+          # that event by mistake — P1 (this step's own `if:`) is true on
+          # `release` too, but guard/P2 is not, so this resolves to ''.
+          # An unset/empty result here is a true no-op: action-gh-release@v2
+          # treats an empty body_path as "not given" and falls through to
+          # `body` (also unset) — verified against its source (util.ts
+          # releaseBody: `if (config.input_body_path)` is falsy for '') —
+          # so this is byte-for-byte what publishing looked like before
+          # notes-file existed. When set, action-gh-release reads the file
+          # itself for the body, and — generate_release_notes staying on —
+          # appends the generated notes after it (verified against its
+          # source: github.ts prepareReleaseMutation does
+          # `${body}\n\n${generatedNotes}` when both are present), so
+          # authored notes always come first. This is the one place
+          # notes-file reaches something other than a shell — an action
+          # `with:` field — the same category this file already exempts for
+          # `ref` (checkout's `ref:` above) and `target_commitish` above.
+          body_path: ${{ steps.decision.outputs.guard == 'true' && inputs['notes-file'] || '' }}
           files: build/*.mrpack
 
       # Secrets can't be referenced directly in `if:`, so map them into env
@@ -265,23 +350,38 @@ jobs:
           fi
           echo "file=${mrpacks[0]}" >> "$GITHUB_OUTPUT"
 
-      # The changelog is github.event.release.body, which anyone who can cut
-      # a release controls. Written to a file from env: rather than
-      # interpolated into a run: body, per the convention above (lines
-      # 36-38) — GitHub substitutes a value into run: textually before the
-      # shell runs it, so a body containing $(...) or a quote must not reach
-      # the shell of a job with contents: write. This also gets multi-line
-      # bodies (the normal case) to rinth cleanly via --changelog-file. Only
-      # a `release` event has a human-authored body; a `publish: true` run
-      # that isn't itself a release event gets an empty changelog file here.
+      # On a `release` event the changelog is github.event.release.body,
+      # which anyone who can cut a release controls; on the P2 path
+      # (push || inputs.publish) it's the validated notes-file instead — the
+      # two are mutually exclusive (P2 excludes release, per the comment
+      # above "Compute publish decision"), so exactly one of RELEASE_BODY /
+      # NOTES_FILE is ever non-empty. RELEASE_BODY is still written to the
+      # file from env: rather than interpolated into a run: body, per the
+      # convention above (lines 36-38) — GitHub substitutes a value into
+      # run: textually before the shell runs it, so a body containing
+      # $(...) or a quote must not reach the shell of a job with
+      # contents: write. NOTES_FILE, by contrast, only ever carries a path
+      # (validated above) — its bytes are copied straight from disk with
+      # `cp`, never round-tripped through a shell variable, so trailing
+      # newlines and any shell-special bytes in the file's actual content
+      # survive untouched (an env var/`printf '%s'` round-trip would not
+      # necessarily preserve those the same way). When neither is set
+      # (unset notes-file on a non-release P2 run, or Modrinth configured
+      # with nothing else supplying a body), this still produces an empty
+      # changelog file — unchanged from before notes-file existed.
       - name: Write Modrinth changelog to file
         if: steps.modrinth_check.outputs.has_modrinth == 'true'
         id: changelog
         env:
           RELEASE_BODY: ${{ github.event_name == 'release' && github.event.release.body || '' }}
+          NOTES_FILE: ${{ steps.decision.outputs.guard == 'true' && inputs['notes-file'] || '' }}
         run: |
           file="$RUNNER_TEMP/modrinth-changelog.txt"
-          printf '%s' "$RELEASE_BODY" > "$file"
+          if [ -n "$NOTES_FILE" ]; then
+            cp -- "$NOTES_FILE" "$file"
+          else
+            printf '%s' "$RELEASE_BODY" > "$file"
+          fi
           echo "file=$file" >> "$GITHUB_OUTPUT"
 
       - uses: oven-sh/setup-bun@v2
