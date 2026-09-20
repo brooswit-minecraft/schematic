@@ -698,6 +698,24 @@ def enforce_backup_retention(sftp, backups_dir, level_name, retention):
     return excess
 
 
+def sweep_stale_stage_files(sftp, backups_dir):
+    """Remove any pre-existing BACKUP_STAGE_PREFIX regular file in
+    backups_dir — leftovers from a run that was killed (SIGKILL, runner
+    loss) before it reached the try/except in archive_and_prune below that
+    normally cleans its own stage file up. Only that prefix, only regular
+    files; nothing else in backups/ is ever touched here.
+
+    Safe to run unconditionally at the start of every archive_and_prune
+    call, even though it may remove a file a CONCURRENT run is still
+    writing: the workflow's own `concurrency` group
+    (schematic-sftp-${{ github.repository }}, cancel-in-progress: false)
+    serializes every sftp-route run against this same server, so there is
+    never a second run actively writing a stage file while this one starts."""
+    for item in sftp.listdir_attr(backups_dir):
+        if stat.S_ISREG(item.st_mode) and item.filename.startswith(BACKUP_STAGE_PREFIX):
+            sftp.remove(backups_dir + "/" + item.filename)
+
+
 def archive_and_prune(sftp, root, retention, tar_dir, tag="deploy", now=None):
     """The SFTP-side half of the backup: build the archive, upload it to a
     staged name, verify the STAGED copy's size/hash, promote it with an
@@ -711,6 +729,7 @@ def archive_and_prune(sftp, root, retention, tar_dir, tag="deploy", now=None):
     directory(sftp, root or "/")
     backups_dir = root + "/backups"
     directory(sftp, backups_dir, create=True)
+    sweep_stale_stage_files(sftp, backups_dir)
 
     level_name = read_level_name(sftp, root)
     when = now() if callable(now) else (now or datetime.now(timezone.utc))
@@ -724,13 +743,26 @@ def archive_and_prune(sftp, root, retention, tar_dir, tag="deploy", now=None):
     if attributes(sftp, remote_target) is not None:
         raise ValueError("Backup archive name collision on remote host: " + filename)
     stage = backups_dir + "/" + BACKUP_STAGE_PREFIX + uuid.uuid4().hex
-    sftp.put(str(tar_path), stage)
-    with sftp.open(stage, "rb") as source:
-        remote_digest, remote_size = stream_hash(source)
-    if remote_digest != digest or remote_size != archive_bytes:
-        sftp.remove(stage)
-        raise ValueError("Backup upload failed size/hash verification")
-    sftp.posix_rename(stage, remote_target)
+    # put()/the read-back/the rename can all fail partway (connection drop,
+    # the 60s channel timeout, the host running out of disk — the likely
+    # reason a put fails) and leave a partial file at `stage`. BaseException
+    # (not just Exception) so a KeyboardInterrupt/cancellation during this
+    # window still gets best-effort cleanup: a failure to remove the stage
+    # file must never mask the ORIGINAL error, so that removal is itself
+    # wrapped and swallowed before re-raising.
+    try:
+        sftp.put(str(tar_path), stage)
+        with sftp.open(stage, "rb") as source:
+            remote_digest, remote_size = stream_hash(source)
+        if remote_digest != digest or remote_size != archive_bytes:
+            raise ValueError("Backup upload failed size/hash verification")
+        sftp.posix_rename(stage, remote_target)
+    except BaseException:
+        try:
+            sftp.remove(stage)
+        except Exception:
+            pass
+        raise
 
     removed = enforce_backup_retention(sftp, backups_dir, level_name, retention)
     return {"archive": filename, "archive_bytes": archive_bytes, "world_bytes": world_bytes,
@@ -754,12 +786,17 @@ def backup_env_config(env):
 def backup(env=os.environ, command=None, connect=None):
     """Archive the world over the existing SFTP access, before any pack
     upload. Consistency: save-off + save-all flush before archiving,
-    save-on GUARANTEED afterwards via try/finally — even when the archive
+    save-on issued afterwards via try/finally — even when the archive
     itself fails — so a failed backup can never leave autosave disabled on
-    the live world. Any exception here (including one raised while the
-    world is quiesced) propagates to the caller, which — run as its own
-    workflow step with no `continue-on-error`/`if: always()` — aborts the
-    job before the next step (the pack upload) ever starts.
+    the live world. This covers every ordinary exception and a
+    Ctrl-C/cancellation during the archive, but NOT a SIGKILL or the
+    runner disappearing mid-archive (nothing running in Python can trap
+    either) — see the README's caveat and one-line manual remedy (RCON
+    `save-on`) for that residual case. Any exception here (including one
+    raised while the world is quiesced) propagates to the caller, which —
+    run as its own workflow step with no `continue-on-error`/`if:
+    always()` — aborts the job before the next step (the pack upload)
+    ever starts.
 
     `command`/`connect` default to None (resolved to the real
     rcon_command/connect_backup INSIDE the function body, not as a default

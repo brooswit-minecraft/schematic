@@ -531,6 +531,40 @@ class DeploymentTest(unittest.TestCase):
                 deploy.archive_and_prune(self.sftp, "/server", 5, tar_dir)
         self.assertFalse(list((self.remote / "server/backups").glob(deploy.BACKUP_STAGE_PREFIX + "*")))
 
+    def test_backup_partial_put_failure_cleans_up_stage_and_propagates(self):
+        (self.remote / "server/world").mkdir()
+        (self.remote / "server/world/level.dat").write_bytes(b"leveldata")
+
+        def failing_put(source, target):
+            # Simulate a connection drop partway through the upload: the
+            # staged file is left half-written, then the call raises.
+            self.sftp.path(target).write_bytes(b"only-half-the-archive")
+            raise ConnectionError("simulated disconnect during put")
+
+        self.sftp.put = failing_put
+        with tempfile.TemporaryDirectory() as tar_dir:
+            with self.assertRaisesRegex(ConnectionError, "simulated disconnect"):
+                deploy.archive_and_prune(self.sftp, "/server", 5, tar_dir)
+        self.assertFalse(list((self.remote / "server/backups").glob(deploy.BACKUP_STAGE_PREFIX + "*")),
+                          "a partial stage file from a failed put must not be left behind")
+
+    def test_backup_sweeps_stale_stage_file_from_killed_run_before_archiving(self):
+        (self.remote / "server/world").mkdir()
+        (self.remote / "server/world/level.dat").write_bytes(b"leveldata")
+        backups = self.remote / "server/backups"
+        backups.mkdir(parents=True)
+        stale = backups / (deploy.BACKUP_STAGE_PREFIX + "deadbeef")
+        stale.write_bytes(b"leftover from a run that was killed before it cleaned up")
+        unrelated = backups / "not-a-backup.txt"
+        unrelated.write_bytes(b"leave me alone")
+
+        with tempfile.TemporaryDirectory() as tar_dir:
+            result = deploy.archive_and_prune(self.sftp, "/server", 5, tar_dir)
+
+        self.assertFalse(stale.exists(), "a stale stage file from a killed prior run must be swept")
+        self.assertTrue(unrelated.exists(), "the sweep must never touch files outside its own prefix")
+        self.assertTrue((backups / result["archive"]).exists())
+
     def test_backup_retention_keeps_n_most_recent_and_ignores_unrelated_files(self):
         backups = self.remote / "server/backups"
         backups.mkdir(parents=True)

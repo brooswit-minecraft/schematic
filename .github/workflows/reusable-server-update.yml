@@ -74,8 +74,9 @@ on:
           directories (level-name, +_nether, +_the_end — read from the
           remote server.properties, default "world") to
           <SERVER_SFTP_PATH>/backups/ as a single tar.gz, after an RCON
-          save-off + save-all flush (save-on is GUARANTEED afterwards, even
-          when the archive fails) and before any pack file is uploaded —
+          save-off + save-all flush (save-on is issued afterwards even when
+          the archive fails, via try/finally — see the README's caveat on
+          the one case that can't be trapped) and before any pack file is uploaded —
           see the "Archive world before upload" step below. A failed
           archive aborts the deploy before any upload; nothing is
           partially applied. Old archives beyond `backup-retention` are
@@ -425,8 +426,8 @@ jobs:
       # supervisor, and atomically upload files" step below — that ordering
       # in this file IS the evidence that the archive happens before any
       # upload. See server_deploy.py's backup() for the RCON
-      # save-off/save-all-flush/save-on sequence (save-on guaranteed even on
-      # failure) and archive_and_prune() for the SFTP side (build, verify,
+      # save-off/save-all-flush/save-on sequence (save-on issued even on
+      # failure, via try/finally) and archive_and_prune() for the SFTP side (build, verify,
       # promote, then prune retention). No `continue-on-error`/`if:
       # always()` here: a failed archive fails this step, which fails the
       # job before the next step (the upload) ever runs — the deliberate

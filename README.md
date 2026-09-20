@@ -650,9 +650,13 @@ new credentials. Enable it on a consumer's stub with:
 **When it runs.** After the world is quiesced (RCON `save-off` then `save-all
 flush`) and before any pack file is uploaded — see the "Archive world before
 upload" step in `reusable-server-update.yml`, which runs strictly before the
-step that uploads pack files. `save-on` is issued unconditionally afterwards,
-even when the archive fails, so a failed backup can never leave autosave
-disabled on the live world.
+step that uploads pack files. `save-on` is issued afterwards via
+`try`/`finally`, even when the archive fails, so an ordinary failure (or a
+Ctrl-C/cancellation) can never leave autosave disabled on the live world.
+**Caveat:** nothing running in Python can trap a SIGKILL or the runner
+disappearing mid-archive — that residual case can still leave autosave off;
+if a run ends that way, send `save-on` by hand over RCON before trusting the
+world's autosave state again.
 
 **What is archived.** The world directories only — never logs, jars, the pack,
 or anything else in `SERVER_SFTP_PATH`. The level name is read from the remote
@@ -660,7 +664,11 @@ or anything else in `SERVER_SFTP_PATH`. The level name is read from the remote
 path separators, no hidden/absolute names, no symlinks anywhere inside); the
 three directories `<level>`, `<level>_nether` and `<level>_the_end` are
 included whenever each exists (a brand-new world may not have generated the
-nether/end yet — that is not an error).
+nether/end yet — that is not an error). A file that grows between being
+listed and being read is captured only up to the size seen at listing time
+(the archive format requires declaring each entry's size up front) — with
+`save-off` in effect this should be rare, but the archive is not guaranteed
+byte-exact for a file actively being written at the moment of archiving.
 
 **Where it goes, and the naming scheme.** A single `tar.gz` per run, written to
 `<SERVER_SFTP_PATH>/backups/` (already excluded from pack management — see
@@ -671,10 +679,18 @@ nether/end yet — that is not an error).
 ```
 
 The timestamp format sorts lexicographically in chronological order. It is
-uploaded to a temporary staged name first, and only promoted to its real name
-(atomic rename) after the staged copy's size and hash are read back and
-verified — a corrupt or interrupted upload is never promoted, and never
-counts against retention.
+uploaded to a temporary staged name first (`.schematic-backup-stage-<uuid>`),
+and only promoted to its real name (atomic rename) after the staged copy's
+size and hash are read back and verified — a corrupt or interrupted upload is
+never promoted, and never counts against retention. If the upload, the
+verification, or the rename itself fails partway (connection drop, the
+staging step's channel timeout, the host running out of disk), the partial
+staged file is removed as part of handling that failure; if a run is killed
+before it can even do that (SIGKILL, runner loss), the **next** run sweeps
+any pre-existing staged file it finds before starting its own archive —
+safe because the workflow's own `concurrency` group serializes every
+`sftp`-route run against a given consumer, so there is never a second run
+concurrently writing one.
 
 **Retention.** `backup-retention` (default `5`) is the number of most recent
 archives to keep; older ones matching this feature's own naming pattern for
