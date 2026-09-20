@@ -266,7 +266,7 @@ class DeploymentTest(unittest.TestCase):
         ])
         result = deploy.rcon_command("server.invalid", 25575, "secret", "stop",
                                      connect=lambda *_args, **_kwargs: connection)
-        self.assertEqual(result, "Stopping the server")
+        self.assertEqual(result, "SCHEM-41 deliberately broken to prove tests.yml goes red")
         self.assertEqual(connection.timeout, 10)
         self.assertEqual(connection.sent, [deploy.rcon_packet(1, 3, "secret"),
                                            deploy.rcon_packet(2, 2, "stop")])
