@@ -100,6 +100,13 @@ class FakeRCONSocket:
 
 
 class DeploymentTest(unittest.TestCase):
+    # SCHEM-41 throwaway (never merge): proves the skip guard's new pattern
+    # catches "OK (skipped=N, expected failures=M)", the shape that
+    # defeated the old "(skipped=N)"-anchored pattern.
+    @unittest.expectedFailure
+    def test_schem41_throwaway_expected_failure(self):
+        self.assertEqual(1, 2)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

@@ -32,10 +32,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Same pin the sftp job in reusable-server-update.yml uses, so the two
-      # cannot drift.
+      # SCHEM-41 throwaway (never merge): paramiko deliberately NOT installed
+      # AND tests/test_server_deploy.py carries a throwaway
+      # @unittest.expectedFailure, so the summary reads
+      # "OK (skipped=3, expected failures=1)" — the exact shape that
+      # defeated the OLD guard (anchored on "(skipped=N)" as the whole
+      # parenthesis) but that the NEW guard (matching "skipped=[0-9]+"
+      # anywhere) still catches.
       - name: Install test dependencies
-        run: python -m pip install 'paramiko==4.0.0'
+        run: "true"
 
       # A skipped test module (e.g. test_server_backup_loopback.py silently
       # skipping because paramiko didn't import) must fail the run, not pass
