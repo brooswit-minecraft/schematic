@@ -43,13 +43,14 @@ jobs:
       # case, with exit code 0, so we grep the captured output for it
       # ourselves. `set -o pipefail` so a real test failure's non-zero exit
       # isn't swallowed by the `tee` pipe. The pattern deliberately doesn't
-      # anchor on "(skipped=N)" as the whole parenthesis: unittest lists
-      # skipped/expected-failures/unexpected-successes in whatever order
-      # they're non-zero (e.g. "OK (skipped=1, expected failures=1)"), so
-      # anchoring on the parens would stop matching the moment this suite
-      # ever gains an @unittest.expectedFailure. Matching "skipped=N" alone,
-      # or the per-test "... skipped '<reason>'" line -v prints, catches it
-      # regardless of where it lands in the summary.
+      # anchor on "(skipped=N)" as the whole parenthesis: unittest appends
+      # "skipped=N" before any expected-failures/unexpected-successes counts
+      # (e.g. "OK (skipped=1, expected failures=1)"), so anchoring on the
+      # closing paren stops matching as soon as either of those is non-zero
+      # — which this suite would hit the moment it gains an
+      # @unittest.expectedFailure. Matching "skipped=N" alone, or the
+      # per-test "... skipped '<reason>'" line -v prints, catches it
+      # regardless of what follows it in the summary.
       - name: Run unit tests
         run: |
           set -euo pipefail
