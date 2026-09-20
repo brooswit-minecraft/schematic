@@ -68,6 +68,41 @@ on:
           `ref` input.
         required: false
         type: string
+      backup:
+        description: >-
+          SCHEM-38: when true on the sftp route, archives the world
+          directories (level-name, +_nether, +_the_end — read from the
+          remote server.properties, default "world") to
+          <SERVER_SFTP_PATH>/backups/ as a single tar.gz, after an RCON
+          save-off + save-all flush (save-on is issued afterwards even when
+          the archive fails, via try/finally — see the README's caveat on
+          the one case that can't be trapped) and before any pack file is uploaded —
+          see the "Archive world before upload" step below. A failed
+          archive aborts the deploy before any upload; nothing is
+          partially applied. Old archives beyond `backup-retention` are
+          pruned only after the new one is written and verified. Rejected
+          loudly, before any change, when SERVER_DEPLOY_METHOD is
+          modrinth-api (that route has no SFTP access to archive over) —
+          see "Validate deployment selector" below. Leave false (the
+          default) for behaviour that is byte-for-byte what it is today:
+          the archive step's `if:` below means this whole job issues zero
+          extra RCON or SFTP calls when unset.
+        required: false
+        type: boolean
+        default: false
+      backup-retention:
+        description: >-
+          SCHEM-38: number of most-recent world archives to keep in
+          <SERVER_SFTP_PATH>/backups/ once `backup` is true; older archives
+          matching this feature's own `<level>-<UTC timestamp>-<tag>.tar.gz`
+          naming pattern are deleted after each successful archive — nothing
+          else in backups/ is ever touched. Must be a positive integer; 0 is
+          deliberately not treated as "unlimited" (an unbounded backup
+          directory would eventually fill the host's disk). Ignored when
+          `backup` is false.
+        required: false
+        type: number
+        default: 5
 
 jobs:
   deploy-method:
@@ -76,11 +111,29 @@ jobs:
       - name: Validate deployment selector
         env:
           METHOD: ${{ vars.SERVER_DEPLOY_METHOD }}
+          BACKUP: ${{ inputs.backup }}
+          BACKUP_RETENTION: ${{ inputs['backup-retention'] }}
         run: |
           case "${METHOD:-modrinth-api}" in
             modrinth-api|sftp) ;;
             *) echo '::error::SERVER_DEPLOY_METHOD must be modrinth-api or sftp'; exit 1 ;;
           esac
+          # SCHEM-38: fail loudly, before either job below does anything, on
+          # an unsupported backup/route combination or an invalid retention
+          # count — the modrinth-api route has no SFTP access to archive
+          # over, and a silent no-op there would give false confidence that
+          # a backup was taken. Checked here (not inside the sftp job) so
+          # the whole workflow_call fails fast on either route.
+          if [ "$BACKUP" = "true" ]; then
+            if [ "${METHOD:-modrinth-api}" = "modrinth-api" ]; then
+              echo '::error::backup: true requires SERVER_DEPLOY_METHOD=sftp — the modrinth-api route has no SFTP access to archive the world over.'
+              exit 1
+            fi
+            if ! [[ "$BACKUP_RETENTION" =~ ^[0-9]+$ ]] || [ "$BACKUP_RETENTION" -lt 1 ]; then
+              echo "::error::backup-retention must be a positive integer, got '$BACKUP_RETENTION' (0 is not \"unlimited\")"
+              exit 1
+            fi
+          fi
 
   server-update:
     needs: deploy-method
@@ -368,6 +421,37 @@ jobs:
           if [ "${#packs[@]}" -ne 1 ]; then echo '::error::Expected exactly one release pack'; exit 1; fi
           python .schematic-tools/scripts/server_deploy.py materialize \
             --archive "${packs[0]}" --version "${tag#v}" --output "$RUNNER_TEMP/server-files"
+      # SCHEM-38: opt-in world archive, over the SAME SFTP access already
+      # used for pack files. Runs BEFORE the "Verify running server, install
+      # supervisor, and atomically upload files" step below — that ordering
+      # in this file IS the evidence that the archive happens before any
+      # upload. See server_deploy.py's backup() for the RCON
+      # save-off/save-all-flush/save-on sequence (save-on issued even on
+      # failure, via try/finally) and archive_and_prune() for the SFTP side (build, verify,
+      # promote, then prune retention). No `continue-on-error`/`if:
+      # always()` here: a failed archive fails this step, which fails the
+      # job before the next step (the upload) ever runs — the deliberate
+      # abort-on-failure choice for an explicitly-enabled backup, reasoned
+      # about in the PR. `if:` below means this step — and therefore every
+      # RCON/SFTP call inside it — does not run at all when `backup` is
+      # false (the default), which is what keeps that case byte-for-byte
+      # today's behaviour.
+      - name: Archive world before upload
+        if: inputs.backup == true
+        env:
+          SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
+          SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
+          SERVER_RCON_SHUTDOWN_TIMEOUT: ${{ vars.SERVER_RCON_SHUTDOWN_TIMEOUT }}
+          SERVER_RCON_PASSWORD: ${{ secrets.SERVER_RCON_PASSWORD }}
+          SERVER_SFTP_HOST: ${{ vars.SERVER_SFTP_HOST }}
+          SERVER_SFTP_PORT: ${{ vars.SERVER_SFTP_PORT }}
+          SERVER_SFTP_PATH: ${{ vars.SERVER_SFTP_PATH }}
+          SERVER_SFTP_USERNAME: ${{ secrets.SERVER_SFTP_USERNAME }}
+          SERVER_SFTP_PASSWORD: ${{ secrets.SERVER_SFTP_PASSWORD }}
+          SERVER_SFTP_PRIVATE_KEY: ${{ secrets.SERVER_SFTP_PRIVATE_KEY }}
+          SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
+          SERVER_BACKUP_RETENTION: ${{ inputs['backup-retention'] }}
+        run: python .schematic-tools/scripts/server_deploy.py backup
       - name: Verify running server, install supervisor, and atomically upload files
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
