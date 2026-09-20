@@ -386,6 +386,8 @@ rely on `github.sha` being the commit it just released:
 | Input | Type | Default | Effect |
 |---|---|---|---|
 | `ref` | string | `''` | Checks out this ref/SHA instead of the caller's own triggering ref, in both the `modrinth-api` and `sftp` jobs (not the `sftp` job's separate checkout of this repo's own `v1` deploy scripts, which is unrelated to the caller's release). Also determines what commit the `pack.toml` fallback reads when `version` is not given. Leave empty for unchanged behaviour, matching `reusable-release.yml`'s `ref` input. |
+| `backup` | boolean | `false` | `sftp` route only: archive the world before uploading, with retention. See [Pre-deploy world archive](#pre-deploy-world-archive-opt-in) below. Rejected loudly (before any change) if the resolved route is `modrinth-api`, which has no SFTP access to archive over. |
+| `backup-retention` | number | `5` | How many recent world archives to keep once `backup` is `true`. Must be a positive integer; `0` is rejected, not treated as "unlimited". Ignored when `backup` is `false`. |
 
 An automated caller that calls this workflow directly right after publishing a release
 — rather than relying on the `workflow_run` chain — has an `event_name` of its own
@@ -634,8 +636,114 @@ retrying. Never clear the marker automatically after a partial promotion.
 Unknown host keys are rejected; do not replace verification with `ssh-keyscan`
 trust-on-first-use. Downloaded pack contents must come from trusted releases.
 
-Local verification (no network or server credentials):
+### Pre-deploy world archive (opt-in)
+
+`sftp`-route only, off by default, over the SFTP access the route already has — no
+new credentials. Enable it on a consumer's stub with:
+
+```yaml
+    with:
+      backup: true
+      backup-retention: 5   # optional; 5 is also the default when omitted
+```
+
+**When it runs.** After the world is quiesced (RCON `save-off` then `save-all
+flush`) and before any pack file is uploaded — see the "Archive world before
+upload" step in `reusable-server-update.yml`, which runs strictly before the
+step that uploads pack files. `save-on` is issued unconditionally afterwards,
+even when the archive fails, so a failed backup can never leave autosave
+disabled on the live world.
+
+**What is archived.** The world directories only — never logs, jars, the pack,
+or anything else in `SERVER_SFTP_PATH`. The level name is read from the remote
+`server.properties`' `level-name` (default `world`) and validated (no `..`, no
+path separators, no hidden/absolute names, no symlinks anywhere inside); the
+three directories `<level>`, `<level>_nether` and `<level>_the_end` are
+included whenever each exists (a brand-new world may not have generated the
+nether/end yet — that is not an error).
+
+**Where it goes, and the naming scheme.** A single `tar.gz` per run, written to
+`<SERVER_SFTP_PATH>/backups/` (already excluded from pack management — see
+`PROTECTED` in `scripts/server_deploy.py`) as:
+
+```
+<level>-<UTC timestamp>-<tag>.tar.gz          e.g. world-20260920T063000Z-1.2.3.tar.gz
+```
+
+The timestamp format sorts lexicographically in chronological order. It is
+uploaded to a temporary staged name first, and only promoted to its real name
+(atomic rename) after the staged copy's size and hash are read back and
+verified — a corrupt or interrupted upload is never promoted, and never
+counts against retention.
+
+**Retention.** `backup-retention` (default `5`) is the number of most recent
+archives to keep; older ones matching this feature's own naming pattern for
+the same level are deleted — nothing else under `backups/` is ever touched,
+and pruning only happens after the new archive is written and verified, so a
+failed run can never shrink the number of good backups. `backup-retention`
+must be a positive integer; `0` is rejected outright, not treated as
+"unlimited".
+
+**Failure behaviour.** An archive failure with `backup: true` **aborts the
+deploy before any upload** — the archive step has no `continue-on-error` or
+`if: always()`, so the job simply fails there. This is deliberate: a silent
+skip would defeat the purpose of an explicitly-requested backup, and nothing
+has been uploaded yet at that point, so aborting costs nothing beyond the
+backup itself not existing this run — a re-run is always safe.
+
+**The `modrinth-api` route** has no SFTP access at all, so it cannot archive
+anything. Setting `backup: true` without `SERVER_DEPLOY_METHOD: sftp` is
+rejected loudly by the "Validate deployment selector" job step, before either
+route does anything — never a silent no-op that would give false confidence a
+backup was taken.
+
+**Restoring an archive by hand.** There is no automated restore — do this:
+
+1. Stop the Minecraft server first (e.g. RCON `stop`, or via the Hosting
+   panel). Restoring into a running world will corrupt it.
+2. The archive lives at `<SERVER_SFTP_PATH>/backups/<level>-<timestamp>-<tag>.tar.gz`
+   on the SFTP host; download it (e.g. `sftp` or `scp`) to wherever you'll
+   extract it.
+3. Move the existing (possibly broken) world directories aside rather than
+   deleting them outright, in case something is still needed from them:
+   `mv <level> <level>.broken` (repeat for `<level>_nether`/`<level>_the_end`
+   if present).
+4. Extract the archive at the server root: `tar -xzf <archive> -C
+   <SERVER_SFTP_PATH>/`. It expands directly into `<level>/`,
+   `<level>_nether/` and `<level>_the_end/` (whichever were present at backup
+   time) — no extra path prefix to strip.
+5. **Ownership/permissions caveat:** the archive was built by the deploy
+   runner reading over SFTP, so extracted files may not match the server
+   process's expected owner/group or the original file permissions exactly
+   (world files were `0o644` inside the tar; directories default to your
+   extracting tool's umask). Fix ownership/permissions to match what the
+   Minecraft process expects on that host before starting it (e.g. `chown -R`
+   to the service user) — an SFTP-chrooted account often doesn't need this,
+   but verify for your host.
+6. Restart the server and verify: confirm it starts without a "failed to load
+   level" error, `list`/log in-game to confirm the expected spawn point and a
+   sampling of known builds are present. Only delete the `.broken` directories
+   once you've confirmed the restore is good.
+
+**Disk usage.** Each archive is a compressed copy of the world at that moment,
+so archive size scales with world size (compression ratio varies with how much
+of the world is already-compressed region data vs. NBT/metadata — do not
+assume a fixed ratio). With the default retention of `5`, worst-case steady-state
+usage is roughly **5× the compressed world size**, and it accumulates on the
+**same host as the world itself** — this protects against a bad plugin/mod
+corrupting the world, but a `backups/` directory living on the same disk as
+the live world is not protection against loss of that host. Size
+`backup-retention` (and monitor host disk) accordingly for large worlds.
+
+Local verification (no network or server credentials — `tests/test_server_backup_loopback.py`
+exercises the backup path over a real SFTP/RCON protocol pair, but entirely on
+127.0.0.1 loopback sockets with made-up test credentials, never a real host):
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+`test_server_backup_loopback.py` needs `paramiko` installed (`pip install
+paramiko==4.0.0`, matching the version the workflow itself installs) — it is
+skipped, not failed, when paramiko isn't available, so the rest of the suite
+is unaffected either way.

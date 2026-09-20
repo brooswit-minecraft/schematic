@@ -1,9 +1,13 @@
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import shutil
+import sys
+import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -65,7 +69,8 @@ class FakeSFTP:
         self.path(source).replace(self.path(target))
 
     def listdir_attr(self, path):
-        return [SimpleNamespace(filename=p.name, st_mode=p.lstat().st_mode) for p in self.path(path).iterdir()]
+        return [SimpleNamespace(filename=p.name, st_mode=p.lstat().st_mode, st_size=p.lstat().st_size)
+                for p in self.path(path).iterdir()]
 
 
 class FakeRCONSocket:
@@ -417,6 +422,235 @@ class DeploymentTest(unittest.TestCase):
                          ("host", 25575, "password", 120.0))
         with self.assertRaisesRegex(ValueError, "RCON"):
             deploy.rcon_config({})
+
+    # --- Pre-deploy world archive (SCHEM-38) ---------------------------
+
+    def backup_config(self, **overrides):
+        config = {"SERVER_RCON_HOST": "server.invalid", "SERVER_RCON_PASSWORD": "secret",
+                  "SERVER_SFTP_HOST": "server.invalid", "SERVER_SFTP_USERNAME": "user",
+                  "SERVER_SFTP_PATH": "/server", "SERVER_SFTP_KNOWN_HOSTS": "kh",
+                  "SERVER_SFTP_PASSWORD": "sftp-secret"}
+        config.update(overrides)
+        return config
+
+    def test_safe_component_rejects_unsafe_values(self):
+        for value in ("", ".", "..", ".hidden", "a/b", "a\\b", "a:b", "a\nb", None, 5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                deploy.safe_component(value)
+        self.assertEqual(deploy.safe_component("world"), "world")
+
+    def test_backup_filename_and_pattern(self):
+        when = datetime(2026, 9, 20, 6, 30, 0, tzinfo=timezone.utc)
+        name = deploy.backup_filename("world", "1.2.3", when)
+        self.assertEqual(name, "world-20260920T063000Z-1.2.3.tar.gz")
+        self.assertRegex(name, deploy.backup_pattern("world"))
+        self.assertNotRegex("otherlevel-20260920T063000Z-1.2.3.tar.gz", deploy.backup_pattern("world"))
+        self.assertNotRegex("world-20260920T063000Z-1.2.3.tar.gz.bak", deploy.backup_pattern("world"))
+        self.assertEqual(deploy.backup_filename("world", "", when), "world-20260920T063000Z-deploy.tar.gz")
+
+    def test_parse_retention_rejects_non_positive_integers(self):
+        for bad in ("0", "-1", "abc", "5.5", "", None, " "):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                deploy.parse_retention(bad)
+        self.assertEqual(deploy.parse_retention("5"), 5)
+        self.assertEqual(deploy.parse_retention(5), 5)
+
+    def test_backup_level_name_defaults_and_reads_configured_value(self):
+        self.assertEqual(deploy.read_level_name(self.sftp, "/server"), "world")
+        (self.remote / "server/server.properties").write_text("motd=hi\n")
+        self.assertEqual(deploy.read_level_name(self.sftp, "/server"), "world")
+        (self.remote / "server/server.properties").write_text("# comment\nlevel-name=myworld\n")
+        self.assertEqual(deploy.read_level_name(self.sftp, "/server"), "myworld")
+
+    def test_backup_level_name_rejects_traversal_and_hidden_values(self):
+        for bad in ("../escape", "/absolute", ".hidden", "a/b"):
+            (self.remote / "server/server.properties").write_text(f"level-name={bad}\n")
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                deploy.read_level_name(self.sftp, "/server")
+
+    def test_backup_missing_world_directory_refused(self):
+        with tempfile.TemporaryDirectory() as tar_dir:
+            with self.assertRaisesRegex(ValueError, "not found"):
+                deploy.build_world_archive(self.sftp, "/server", "world", Path(tar_dir) / "x.tar.gz")
+
+    def test_backup_refuses_symlink_in_world(self):
+        world = self.remote / "server/world"
+        world.mkdir()
+        (world / "level.dat").write_bytes(b"x")
+        outside = self.root / "outside"
+        outside.mkdir()
+        (world / "escape").symlink_to(outside, target_is_directory=True)
+        with tempfile.TemporaryDirectory() as tar_dir:
+            with self.assertRaises(ValueError):
+                deploy.build_world_archive(self.sftp, "/server", "world", Path(tar_dir) / "x.tar.gz")
+
+    def test_backup_creates_verified_archive_of_world_dirs_only(self):
+        (self.remote / "server/world/region").mkdir(parents=True)
+        (self.remote / "server/world/level.dat").write_bytes(b"leveldata")
+        (self.remote / "server/world/region/r.0.0.mca").write_bytes(b"regiondata")
+        (self.remote / "server/world_nether").mkdir()
+        (self.remote / "server/world_nether/level.dat").write_bytes(b"netherdata")
+        (self.remote / "server/logs").mkdir()
+        (self.remote / "server/logs/latest.log").write_bytes(b"not archived")
+        when = datetime(2026, 9, 20, 6, 30, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tar_dir:
+            result = deploy.archive_and_prune(self.sftp, "/server", 5, tar_dir, tag="1.2.3", now=when)
+        self.assertEqual(result["archive"], "world-20260920T063000Z-1.2.3.tar.gz")
+        self.assertEqual(result["files"], 3)
+        self.assertEqual(result["removed"], [])
+        archived = self.remote / "server/backups" / result["archive"]
+        self.assertTrue(archived.exists())
+        with tarfile.open(archived) as tar:
+            names = sorted(tar.getnames())
+        self.assertEqual(names, ["world/level.dat", "world/region/r.0.0.mca", "world_nether/level.dat"])
+        self.assertFalse(list((self.remote / "server/backups").glob(deploy.BACKUP_STAGE_PREFIX + "*")))
+
+    def test_backup_rejects_remote_name_collision(self):
+        when = datetime(2026, 9, 20, 6, 30, 0, tzinfo=timezone.utc)
+        backups = self.remote / "server/backups"
+        backups.mkdir(parents=True)
+        (backups / "world-20260920T063000Z-1.2.3.tar.gz").write_bytes(b"existing")
+        (self.remote / "server/world").mkdir()
+        (self.remote / "server/world/level.dat").write_bytes(b"x")
+        with tempfile.TemporaryDirectory() as tar_dir:
+            with self.assertRaisesRegex(ValueError, "collision"):
+                deploy.archive_and_prune(self.sftp, "/server", 5, tar_dir, tag="1.2.3", now=when)
+
+    def test_backup_upload_hash_mismatch_detected_and_stage_cleaned_up(self):
+        (self.remote / "server/world").mkdir()
+        (self.remote / "server/world/level.dat").write_bytes(b"leveldata")
+        original_put = self.sftp.put
+
+        def corrupting_put(source, target):
+            original_put(source, target)
+            self.sftp.path(target).write_bytes(b"corrupted")
+
+        self.sftp.put = corrupting_put
+        with tempfile.TemporaryDirectory() as tar_dir:
+            with self.assertRaisesRegex(ValueError, "verification"):
+                deploy.archive_and_prune(self.sftp, "/server", 5, tar_dir)
+        self.assertFalse(list((self.remote / "server/backups").glob(deploy.BACKUP_STAGE_PREFIX + "*")))
+
+    def test_backup_retention_keeps_n_most_recent_and_ignores_unrelated_files(self):
+        backups = self.remote / "server/backups"
+        backups.mkdir(parents=True)
+        for day in (1, 2, 3):
+            (backups / f"world-2026010{day}T000000Z-x.tar.gz").write_bytes(b"old")
+        (backups / "not-a-backup.txt").write_bytes(b"keep me")
+        (backups / "otherlevel-20260101T000000Z-x.tar.gz").write_bytes(b"different level, keep me")
+
+        removed = deploy.enforce_backup_retention(self.sftp, "/server/backups", "world", 3)
+        self.assertEqual(removed, [])
+
+        (backups / "world-20260104T000000Z-x.tar.gz").write_bytes(b"new, this is the (N+1)th")
+        removed = deploy.enforce_backup_retention(self.sftp, "/server/backups", "world", 3)
+        self.assertEqual(removed, ["world-20260101T000000Z-x.tar.gz"])
+        self.assertFalse((backups / "world-20260101T000000Z-x.tar.gz").exists())
+        self.assertTrue((backups / "not-a-backup.txt").exists())
+        self.assertTrue((backups / "otherlevel-20260101T000000Z-x.tar.gz").exists())
+        remaining = sorted(p.name for p in backups.glob("world-*"))
+        self.assertEqual(remaining, ["world-20260102T000000Z-x.tar.gz", "world-20260103T000000Z-x.tar.gz",
+                                      "world-20260104T000000Z-x.tar.gz"])
+
+    def test_backup_retention_rejects_invalid_n_before_touching_backups(self):
+        for bad in (0, -1, 1.5, True, "5"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                deploy.enforce_backup_retention(self.sftp, "/server/backups", "world", bad)
+
+    def test_backup_env_config_validates_and_defaults_retention(self):
+        config = self.backup_config()
+        self.assertEqual(deploy.backup_env_config(config), ("/server", deploy.DEFAULT_BACKUP_RETENTION))
+        config["SERVER_BACKUP_RETENTION"] = "3"
+        self.assertEqual(deploy.backup_env_config(config), ("/server", 3))
+        config["SERVER_BACKUP_RETENTION"] = "0"
+        with self.assertRaises(ValueError):
+            deploy.backup_env_config(config)
+        del config["SERVER_RCON_HOST"]
+        with self.assertRaises(ValueError):
+            deploy.backup_env_config(config)
+
+    def test_backup_validates_configuration_before_any_rcon_call(self):
+        config = self.backup_config(SERVER_BACKUP_RETENTION="0")
+        with mock.patch.object(deploy, "rcon_command") as rcon_fn:
+            with self.assertRaises(ValueError):
+                deploy.backup(config)
+        rcon_fn.assert_not_called()
+
+    def test_backup_flushes_world_archives_then_saves_on(self):
+        calls = []
+
+        def command(_host, _port, _password, operation, **_kwargs):
+            calls.append(operation)
+            return "ok"
+
+        def connect(root, retention, tar_dir, env, tag):
+            calls.append("archive:" + root)
+            return {"archive": "world-x.tar.gz", "removed": []}
+
+        result = deploy.backup(self.backup_config(), command=command, connect=connect)
+        self.assertEqual(calls, ["save-off", "save-all flush", "archive:/server", "save-on"])
+        self.assertEqual(result["archive"], "world-x.tar.gz")
+
+    def test_backup_failure_still_issues_save_on_and_propagates_before_any_upload(self):
+        calls = []
+
+        def command(_host, _port, _password, operation, **_kwargs):
+            calls.append(operation)
+            return "ok"
+
+        def connect(root, retention, tar_dir, env, tag):
+            raise ValueError("simulated archive failure")
+
+        with self.assertRaisesRegex(ValueError, "simulated archive failure"):
+            deploy.backup(self.backup_config(), command=command, connect=connect)
+        self.assertEqual(calls, ["save-off", "save-all flush", "save-on"])
+
+    def test_backup_save_on_guaranteed_even_when_flush_itself_fails(self):
+        calls = []
+
+        def command(_host, _port, _password, operation, **_kwargs):
+            calls.append(operation)
+            if operation == "save-all flush":
+                raise OSError("rcon hiccup")
+            return "ok"
+
+        def connect(*_args, **_kwargs):
+            self.fail("must not archive when the pre-archive flush failed")
+
+        with self.assertRaises(OSError):
+            deploy.backup(self.backup_config(), command=command, connect=connect)
+        self.assertEqual(calls, ["save-off", "save-all flush", "save-on"])
+
+    def test_deploy_makes_no_backup_or_rcon_calls_when_backup_not_invoked(self):
+        order = []
+        config = {key: "test" for key in ("SERVER_RCON_HOST", "SERVER_RCON_PASSWORD",
+                                            "SERVER_SFTP_HOST", "SERVER_SFTP_USERNAME",
+                                            "SERVER_SFTP_PATH", "SERVER_SFTP_KNOWN_HOSTS")}
+        config["SERVER_SFTP_PASSWORD"] = "secret"
+        with mock.patch.object(deploy, "wait_until_ready", side_effect=lambda _env: order.append("ready")), \
+             mock.patch.object(deploy, "connect_upload", side_effect=lambda _output, _env: order.append("upload")), \
+             mock.patch.object(deploy, "backup") as backup_fn, \
+             mock.patch.object(deploy, "archive_and_prune") as archive_fn, \
+             mock.patch.object(deploy, "rcon_command") as rcon_fn:
+            deploy.deploy("output", config)
+        self.assertEqual(order, ["ready", "upload"])
+        backup_fn.assert_not_called()
+        archive_fn.assert_not_called()
+        rcon_fn.assert_not_called()
+
+    def test_backup_cli_error_never_leaks_secrets(self):
+        config = self.backup_config(SERVER_RCON_PASSWORD="topsecret-rcon",
+                                     SERVER_SFTP_PASSWORD="topsecret-sftp")
+        with mock.patch.object(deploy, "rcon_command",
+                                side_effect=RuntimeError("auth failed with topsecret-rcon / topsecret-sftp")), \
+             mock.patch.object(sys, "argv", ["server_deploy.py", "backup"]), \
+             mock.patch.dict(os.environ, config, clear=True), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            code = deploy.main()
+        self.assertEqual(code, 1)
+        output = stderr.getvalue()
+        self.assertIn("RuntimeError", output)
+        self.assertNotIn("topsecret", output)
 
 
 if __name__ == "__main__":

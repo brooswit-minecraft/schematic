@@ -2,6 +2,8 @@
 """Materialize a release mrpack and deploy pack-owned files to a server."""
 
 import argparse
+import contextlib
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -11,6 +13,7 @@ import socket
 import stat
 import struct
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -69,6 +72,9 @@ PROTECTED = {
     "crash-reports", "server.properties", "eula.txt", "ops.json", "whitelist.json",
     "banned-ips.json", "banned-players.json", "usercache.json", "session.lock",
 }
+BACKUP_SUFFIX = ".tar.gz"
+BACKUP_STAGE_PREFIX = ".schematic-backup-stage-"
+DEFAULT_BACKUP_RETENTION = 5
 
 
 class RCONError(Exception):
@@ -209,6 +215,21 @@ def safe_path(value):
     return value
 
 
+# Validates a single untrusted path SEGMENT (a level-name read from remote
+# server.properties, or one filename entry from a remote directory listing)
+# rather than a whole "/"-joined pack path — safe_path's own PROTECTED check
+# would wrongly reject a level name of "world", which is exactly the value
+# a default server has and must accept.
+def safe_component(value):
+    if not isinstance(value, str) or not value or "/" in value or "\\" in value or ":" in value:
+        raise ValueError("Invalid path component")
+    if value in (".", "..") or value.startswith("."):
+        raise ValueError("Unsafe or hidden path component")
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError("Control character in path component")
+    return value
+
+
 class HTTPSRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if not newurl.startswith("https://"):
@@ -250,6 +271,25 @@ def file_hash(stream):
             raise ValueError("Remote file exceeds verification limit")
         digest.update(chunk)
     return digest.hexdigest()
+
+
+# Unlike file_hash above (capped at MAX_FILE for pack-file download integrity,
+# where an untrusted server response inflating a declared size is the threat
+# being guarded against), a world archive is our own locally-built file and
+# its own remote copy — legitimately larger than MAX_FILE for a real world —
+# so this intentionally has no size ceiling.
+def stream_hash(stream):
+    digest = hashlib.sha512()
+    size = 0
+    while chunk := stream.read(1024 * 1024):
+        size += len(chunk)
+        digest.update(chunk)
+    return digest.hexdigest(), size
+
+
+def local_hash(path):
+    with open(path, "rb") as source:
+        return stream_hash(source)
 
 
 def materialize(archive, output, version, fetch=download):
@@ -480,7 +520,11 @@ def upload_config(env):
     return port
 
 
-def connect_upload(output, env=os.environ):
+@contextlib.contextmanager
+def sftp_session(env):
+    """Open an authenticated SFTP session. Shared by connect_upload (pack
+    files) and connect_backup (world archive) so the connection/host-key/
+    credential-file plumbing exists exactly once."""
     import paramiko
     port = upload_config(env)
     with tempfile.TemporaryDirectory() as temporary:
@@ -502,8 +546,13 @@ def connect_upload(output, env=os.environ):
                            auth_timeout=30, banner_timeout=30)
             with client.open_sftp() as sftp:
                 sftp.get_channel().settimeout(60)
-                upload(sftp, output, env["SERVER_SFTP_PATH"])
-                install_supervisor(sftp, env["SERVER_SFTP_PATH"])
+                yield sftp
+
+
+def connect_upload(output, env=os.environ):
+    with sftp_session(env) as sftp:
+        upload(sftp, output, env["SERVER_SFTP_PATH"])
+        install_supervisor(sftp, env["SERVER_SFTP_PATH"])
 
 
 def deploy(output, env=os.environ):
@@ -516,9 +565,225 @@ def deploy(output, env=os.environ):
     connect_upload(output, env)
 
 
+# --- Pre-deploy world archive (opt-in; SCHEM-38) -----------------------------
+#
+# SFTP has no server-side archive/copy capability, so a tarball cannot be
+# built on the host: files are streamed off the host over SFTP straight into
+# a tar.gz on the runner (build_world_archive), then that single file is
+# uploaded back to <SERVER_SFTP_PATH>/backups/ under a temp name and promoted
+# with the same atomic-rename pattern `upload()` above already uses for pack
+# files, verifying the STAGED COPY's size/hash before promoting it, never
+# after — a corrupt upload must never become the archive retention counts on.
+
+
+def read_level_name(sftp, root, default="world"):
+    """Read `level-name` from the remote server.properties, defaulting to
+    "world" when the key or the file itself is absent. The value is
+    attacker/operator-controlled remote content, so it is validated with
+    safe_component before being used to build any path."""
+    attr = attributes(sftp, root + "/server.properties")
+    if attr is None or not stat.S_ISREG(attr.st_mode):
+        return default
+    with sftp.open(root + "/server.properties", "rb") as source:
+        raw = source.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError("Remote server.properties too large")
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip() != "level-name":
+            continue
+        value = value.strip()
+        return safe_component(value) if value else default
+    return default
+
+
+def walk_remote_files(sftp, path, relative):
+    """Recursively list regular files under a remote directory as
+    (relative_posix_path, absolute_remote_path, size) triples. Every
+    filename is validated with safe_component (rejecting traversal/hidden
+    segments), and any symlink or other non-regular/non-directory entry
+    aborts the walk rather than being silently skipped — the same
+    no-symlink-escape posture `upload()`'s check_mods and materialize's
+    override handling already take, applied to a listing this time instead
+    of a zip/local tree."""
+    for item in sftp.listdir_attr(path):
+        name = safe_component(item.filename)
+        child_path = path + "/" + item.filename
+        child_relative = relative + "/" + name
+        if stat.S_ISLNK(item.st_mode):
+            raise ValueError("Refusing to archive a symlink: " + child_relative)
+        elif stat.S_ISDIR(item.st_mode):
+            yield from walk_remote_files(sftp, child_path, child_relative)
+        elif stat.S_ISREG(item.st_mode):
+            yield child_relative, child_path, item.st_size
+        else:
+            raise ValueError("Refusing to archive a non-regular file: " + child_relative)
+
+
+def build_world_archive(sftp, root, level_name, tar_path):
+    """Stream the level's world directories (level_name, level_name+"_nether",
+    level_name+"_the_end" — whichever exist) into a tar.gz at tar_path. Not
+    logs, jars or the pack. The primary level directory must exist; the
+    nether/end companions are optional (a brand-new world may not have
+    generated them yet)."""
+    primary = root + "/" + level_name
+    attr = attributes(sftp, primary)
+    if attr is None:
+        raise ValueError("World directory not found on server: " + level_name)
+    if not stat.S_ISDIR(attr.st_mode):
+        raise ValueError("World path exists but is not a directory: " + level_name)
+    total = 0
+    count = 0
+    tar_path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for name in (level_name, level_name + "_nether", level_name + "_the_end"):
+            dir_attr = attributes(sftp, root + "/" + name)
+            if dir_attr is None:
+                continue
+            if not stat.S_ISDIR(dir_attr.st_mode):
+                raise ValueError("World path exists but is not a directory: " + name)
+            for child_relative, child_path, size in walk_remote_files(sftp, root + "/" + name, name):
+                info = tarfile.TarInfo(name=child_relative)
+                info.size = size
+                info.mtime = int(time.time())
+                info.mode = 0o644
+                with sftp.open(child_path, "rb") as source:
+                    tar.addfile(info, fileobj=source)
+                total += size
+                count += 1
+    return total, count
+
+
+def backup_filename(level_name, tag, when):
+    """<level>-<UTC timestamp>-<tag>.tar.gz — sortable lexicographically in
+    chronological order, and distinctive enough that retention (below) can
+    never mistake an unrelated file in backups/ for one of its own."""
+    timestamp = when.strftime("%Y%m%dT%H%M%SZ")
+    safe_tag = re.sub(r"[^A-Za-z0-9._-]", "_", tag) if tag else "deploy"
+    return f"{level_name}-{timestamp}-{safe_tag}{BACKUP_SUFFIX}"
+
+
+def backup_pattern(level_name):
+    return re.compile(r"\A" + re.escape(level_name) + r"-\d{8}T\d{6}Z-[A-Za-z0-9._-]+" +
+                       re.escape(BACKUP_SUFFIX) + r"\Z")
+
+
+def parse_retention(value):
+    if value is None or not re.fullmatch(r"[0-9]+", str(value).strip()):
+        raise ValueError("backup retention must be a positive integer, got: " + repr(value))
+    retention = int(value)
+    if retention < 1:
+        raise ValueError("backup retention must be a positive integer (0 is not \"unlimited\"), got: " + str(retention))
+    return retention
+
+
+def enforce_backup_retention(sftp, backups_dir, level_name, retention):
+    """Keep the `retention` most recent archives matching THIS level's own
+    naming pattern; delete only those, never anything else in backups/.
+    Called only after the new archive has been written and verified, so a
+    failed run never shrinks the number of good backups."""
+    if not isinstance(retention, int) or isinstance(retention, bool) or retention < 1:
+        raise ValueError("backup retention must be a positive integer")
+    pattern = backup_pattern(level_name)
+    matches = sorted(
+        item.filename for item in sftp.listdir_attr(backups_dir)
+        if stat.S_ISREG(item.st_mode) and pattern.match(item.filename)
+    )
+    excess = matches[:-retention] if retention < len(matches) else []
+    for name in excess:
+        sftp.remove(backups_dir + "/" + name)
+    return excess
+
+
+def archive_and_prune(sftp, root, retention, tar_dir, tag="deploy", now=None):
+    """The SFTP-side half of the backup: build the archive, upload it to a
+    staged name, verify the STAGED copy's size/hash, promote it with an
+    atomic rename only once verified, then enforce retention. Takes an sftp
+    object directly (not a connection) so it is testable against FakeSFTP
+    exactly like upload()/install_supervisor() above, independent of RCON or
+    paramiko."""
+    root = root.rstrip("/")
+    if not root.startswith("/") or any(p in (".", "..") for p in root.split("/")) or "\\" in root:
+        raise ValueError("SFTP path must be an absolute server directory")
+    directory(sftp, root or "/")
+    backups_dir = root + "/backups"
+    directory(sftp, backups_dir, create=True)
+
+    level_name = read_level_name(sftp, root)
+    when = now() if callable(now) else (now or datetime.now(timezone.utc))
+    filename = backup_filename(level_name, tag, when)
+    tar_path = Path(tar_dir) / filename
+
+    world_bytes, file_count = build_world_archive(sftp, root, level_name, tar_path)
+    digest, archive_bytes = local_hash(tar_path)
+
+    remote_target = backups_dir + "/" + filename
+    if attributes(sftp, remote_target) is not None:
+        raise ValueError("Backup archive name collision on remote host: " + filename)
+    stage = backups_dir + "/" + BACKUP_STAGE_PREFIX + uuid.uuid4().hex
+    sftp.put(str(tar_path), stage)
+    with sftp.open(stage, "rb") as source:
+        remote_digest, remote_size = stream_hash(source)
+    if remote_digest != digest or remote_size != archive_bytes:
+        sftp.remove(stage)
+        raise ValueError("Backup upload failed size/hash verification")
+    sftp.posix_rename(stage, remote_target)
+
+    removed = enforce_backup_retention(sftp, backups_dir, level_name, retention)
+    return {"archive": filename, "archive_bytes": archive_bytes, "world_bytes": world_bytes,
+            "files": file_count, "removed": removed}
+
+
+def connect_backup(root, retention, tar_dir, env, tag):
+    with sftp_session(env) as sftp:
+        return archive_and_prune(sftp, root, retention, tar_dir, tag=tag, now=None)
+
+
+def backup_env_config(env):
+    rcon_config(env)
+    upload_config(env)
+    if not env.get("SERVER_SFTP_PATH"):
+        raise ValueError("Missing required SFTP configuration")
+    retention = parse_retention(env.get("SERVER_BACKUP_RETENTION") or str(DEFAULT_BACKUP_RETENTION))
+    return env["SERVER_SFTP_PATH"], retention
+
+
+def backup(env=os.environ, command=None, connect=None):
+    """Archive the world over the existing SFTP access, before any pack
+    upload. Consistency: save-off + save-all flush before archiving,
+    save-on GUARANTEED afterwards via try/finally — even when the archive
+    itself fails — so a failed backup can never leave autosave disabled on
+    the live world. Any exception here (including one raised while the
+    world is quiesced) propagates to the caller, which — run as its own
+    workflow step with no `continue-on-error`/`if: always()` — aborts the
+    job before the next step (the pack upload) ever starts.
+
+    `command`/`connect` default to None (resolved to the real
+    rcon_command/connect_backup INSIDE the function body, not as a default
+    argument value) so callers/tests can `mock.patch.object(deploy, ...)`
+    them, the same pattern `deploy()` above relies on for wait_until_ready/
+    connect_upload — a default argument value is bound once at import time
+    and would not observe a later patch."""
+    root, retention = backup_env_config(env)
+    host, port, password, _ = rcon_config(env)
+    tag = env.get("SERVER_BACKUP_TAG") or "deploy"
+    caller = command or rcon_command
+    connector = connect or connect_backup
+    try:
+        caller(host, port, password, "save-off")
+        caller(host, port, password, "save-all flush")
+        with tempfile.TemporaryDirectory() as tar_dir:
+            return connector(root, retention, tar_dir, env, tag)
+    finally:
+        caller(host, port, password, "save-on")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("materialize", "deploy", "restart", "wait-ready", "wait-restarted"))
+    parser.add_argument("command", choices=("materialize", "deploy", "restart", "wait-ready", "wait-restarted", "backup"))
     parser.add_argument("--output")
     parser.add_argument("--archive")
     parser.add_argument("--version")
@@ -539,6 +804,12 @@ def main():
             print(restart_and_wait(os.environ))
         elif args.command == "wait-ready":
             print(wait_until_ready(os.environ))
+        elif args.command == "backup":
+            result = backup(os.environ)
+            print("World archived:", result["archive"], "(", result["world_bytes"], "bytes,",
+                  result["files"], "files )")
+            if result["removed"]:
+                print("Pruned old archives:", ", ".join(result["removed"]))
         else:
             print(wait_for_restart(os.environ))
     except Exception as error:
