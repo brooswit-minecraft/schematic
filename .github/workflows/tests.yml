@@ -39,15 +39,22 @@ jobs:
 
       # A skipped test module (e.g. test_server_backup_loopback.py silently
       # skipping because paramiko didn't import) must fail the run, not pass
-      # quietly — unittest's own summary line becomes "OK (skipped=N)" in
-      # that case, with exit code 0, so we grep the captured output for it
+      # quietly — unittest's own summary line includes "skipped=N" in that
+      # case, with exit code 0, so we grep the captured output for it
       # ourselves. `set -o pipefail` so a real test failure's non-zero exit
-      # isn't swallowed by the `tee` pipe.
+      # isn't swallowed by the `tee` pipe. The pattern deliberately doesn't
+      # anchor on "(skipped=N)" as the whole parenthesis: unittest lists
+      # skipped/expected-failures/unexpected-successes in whatever order
+      # they're non-zero (e.g. "OK (skipped=1, expected failures=1)"), so
+      # anchoring on the parens would stop matching the moment this suite
+      # ever gains an @unittest.expectedFailure. Matching "skipped=N" alone,
+      # or the per-test "... skipped '<reason>'" line -v prints, catches it
+      # regardless of where it lands in the summary.
       - name: Run unit tests
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tests -v 2>&1 | tee test-output.log
-          if grep -qE '\(skipped=[0-9]+\)' test-output.log; then
+          if grep -qE 'skipped=[0-9]+|\.\.\. skipped ' test-output.log; then
             echo "::error::One or more test modules were skipped (e.g. paramiko not installed) — the full suite, including the real-protocol loopback tests, must actually run."
             exit 1
           fi
