@@ -60,10 +60,10 @@ Nothing under `.github/workflows` needs editing or deleting — see
 Verify with `grep -ri schematic .`: the only remaining hits should be this README, the
 `uses: brooswit-minecraft/schematic/.github/workflows/reusable-<name>.yml@v1` line in
 each of `ci.yml`, `release.yml`, and `server-update.yml`, and the
-`if: github.repository == 'brooswit-minecraft/schematic'` guard in `tag-v1.yml`. **Leave
-all of those alone** — the `uses:` lines point at this project's upstream reusable
-workflows, not at your own pack, and the `tag-v1.yml` guard is what keeps that
-template-only file from creating a tag in your repo (see
+`if: github.repository == 'brooswit-minecraft/schematic'` guard in `tag-v1.yml` and
+`tests.yml`. **Leave all of those alone** — the `uses:` lines point at this project's
+upstream reusable workflows, not at your own pack, and the `tag-v1.yml`/`tests.yml`
+guards are what keep those template-only files from running in your repo (see
 [Template-only files](#template-only-files) below). Renaming any of them will break the
 thing they exist to do.
 
@@ -131,7 +131,7 @@ updates, pin a specific tag or commit SHA in place of `@v1` in your stub's `uses
 
 ## Template-only files
 
-Four files under `.github/workflows` are template-only, and safe to leave in place:
+Five files under `.github/workflows` are template-only, and safe to leave in place:
 
 `tag-v1.yml` keeps the `v1` tag on **this** repo pointed at its own `main`. It is
 guarded by a `github.repository` check, so it is inert in any repo cloned from this
@@ -143,15 +143,20 @@ template — the job is skipped entirely, so it creates no tag in your repo.
 `brooswit-minecraft/schematic/.github/workflows/reusable-<name>.yml@v1`, so your local
 copies never run.
 
-There's no need to delete any of the four — doing so gains nothing, since they don't
+`tests.yml` runs this repo's own `tests/` suite (the unit tests for
+`scripts/server_deploy.py`) on every push to `main` and every pull request. A consumer
+built from this template has no `tests/` directory, so like `tag-v1.yml` it is guarded
+by the same `github.repository` check — the job is skipped, not failed, in your repo.
+
+There's no need to delete any of the five — doing so gains nothing, since they don't
 run locally either way, and deleting one only creates work for you later: a
 `git merge template/main` does not restore a file you deleted (your deletion simply
 persists, merge or no merge) until the template itself changes that file, at which
 point the merge stops with a delete/modify conflict you have to resolve by hand.
-Leaving the four alone avoids that conflict entirely, on every future merge.
+Leaving the five alone avoids that conflict entirely, on every future merge.
 
 `ci.yml`, `release.yml`, and `server-update.yml` are the three stubs you, as a consumer
-of this template, need to care about — the four template-only files above need no
+of this template, need to care about — the five template-only files above need no
 attention at all.
 
 ## Secrets & variables
@@ -515,6 +520,7 @@ mods/                                one *.pw.toml file per mod, pinning a versi
 .github/workflows/release.yml       cuts a release (see Releasing above)
 .github/workflows/server-update.yml installs each release on a Modrinth-hosted server (see Deploying to a Modrinth Server above)
 .github/workflows/tag-v1.yml        template-only (see Template-only files above)
+.github/workflows/tests.yml         template-only (see Template-only files above)
 .github/workflows/reusable-*.yml    template-only (see Template-only files above)
 Makefile                            the build entry point, shared by humans and CI
 ```

@@ -1,0 +1,53 @@
+name: Tests
+
+# Runs the unit tests in tests/ on every push to main and every pull request —
+# the same trigger surface as ci.yml. Kept as its own repo-local workflow
+# instead of folded into reusable-ci.yml: consumers have no tests/ dir, so a
+# step there would break every pack built from this template, and this
+# repo's own ci.yml calls reusable-ci.yml@v1 (a tag that only moves after
+# merge), so a PR editing reusable-ci.yml could never see its own change go
+# red/green.
+#
+# Template-only: guarded by a `github.repository` check below, the same
+# pattern tag-v1.yml uses, so the job is skipped (not failed) in any repo
+# cloned from this template — those repos have no tests/ dir to run this
+# against. See the README "Template-only files" section.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.repository == 'brooswit-minecraft/schematic'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Same pin the sftp job in reusable-server-update.yml uses, so the two
+      # cannot drift.
+      - name: Install test dependencies
+        run: python -m pip install 'paramiko==4.0.0'
+
+      # A skipped test module (e.g. test_server_backup_loopback.py silently
+      # skipping because paramiko didn't import) must fail the run, not pass
+      # quietly — unittest's own summary line becomes "OK (skipped=N)" in
+      # that case, with exit code 0, so we grep the captured output for it
+      # ourselves. `set -o pipefail` so a real test failure's non-zero exit
+      # isn't swallowed by the `tee` pipe.
+      - name: Run unit tests
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -v 2>&1 | tee test-output.log
+          if grep -qE '\(skipped=[0-9]+\)' test-output.log; then
+            echo "::error::One or more test modules were skipped (e.g. paramiko not installed) — the full suite, including the real-protocol loopback tests, must actually run."
+            exit 1
+          fi
