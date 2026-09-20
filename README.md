@@ -306,13 +306,45 @@ That same pinned rinth CLI performs the version lookup, **authenticated with
 reads — until Modrinth moderation approves it, so without authentication a
 first-release consumer could never be followed. The lookup is bounded to about 5
 minutes before failing, now expressed as rinth's own `--wait` budget rather than a
-hand-rolled retry loop — on the chained `workflow_run` trigger that's just insurance
-against a lag between Modrinth's publish and that version becoming visible over its
-API; on the older `release: published` trigger it's still doing its original job,
-since that trigger races the release workflow with no ordering guarantee between
-them. The ~5 minute bound was checked against a real chained release and kept as-is;
-any consumer still on `release: published` (like schematic-example) depends on that
-same bound today.
+hand-rolled retry loop — on the chained `workflow_run` trigger and on any other
+automated direct call (see below) that's just insurance against a lag between
+Modrinth's publish and that version becoming visible over its API; on the older
+`release: published` trigger it's still doing its original job, since that trigger
+races the release workflow with no ordering guarantee between them. The one path
+that does **not** wait is `workflow_dispatch` (a manual re-point): there the version
+is expected to already exist, so a missing version fails immediately rather than
+spending up to 5 minutes confirming its absence. The ~5 minute bound was checked
+against a real chained release and kept as-is; any consumer still on
+`release: published` (like schematic-example) depends on that same bound today.
+The `sftp` route (below) mirrors this with its own 21-attempt/15s-interval loop,
+gated the same way.
+
+### Updating the server from an automated workflow
+
+Like `reusable-release.yml` (see [above](#releasing-from-an-automated-workflow-with-github_token)),
+`reusable-server-update.yml` accepts an optional `ref` input for a caller that can't
+rely on `github.sha` being the commit it just released:
+
+| Input | Type | Default | Effect |
+|---|---|---|---|
+| `ref` | string | `''` | Checks out this ref/SHA instead of the caller's own triggering ref, in both the `modrinth-api` and `sftp` jobs (not the `sftp` job's separate checkout of this repo's own `v1` deploy scripts, which is unrelated to the caller's release). Also determines what commit the `pack.toml` fallback reads when `version` is not given. Leave empty for unchanged behaviour, matching `reusable-release.yml`'s `ref` input. |
+
+An automated caller that calls this workflow directly right after publishing a release
+— rather than relying on the `workflow_run` chain — has an `event_name` of its own
+(e.g. `repository_dispatch`) that is none of `release`, `workflow_run`, or
+`workflow_dispatch`. That path gets the same `--wait`/retry tolerance as `release` and
+`workflow_run` (see above) automatically: every event except `workflow_dispatch`
+waits. Pass `ref` so the version-resolution fallback reads the commit that was
+actually released, not the commit before it:
+
+```yaml
+  server-update:
+    needs: bump-and-release
+    uses: brooswit-minecraft/schematic/.github/workflows/reusable-server-update.yml@v1
+    with:
+      ref: ${{ needs.bump-and-release.outputs.sha }}
+    secrets: inherit
+```
 
 ### The stub pattern
 
