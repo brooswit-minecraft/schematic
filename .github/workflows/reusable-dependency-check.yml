@@ -1,0 +1,48 @@
+name: Reusable dependency check
+
+# MINECRAFT-38. Callable from a consumer's thin stub. Fails if any pinned
+# mod's REQUIRED NeoForge dependency is not provided (in range) by another
+# pinned jar or a nested jarjar jar. Runs against the CALLER's checkout; the
+# script comes from this repo at v1 (same pattern as reusable-server-update).
+#
+# It downloads each pinned file from its packwiz download.url (unauthenticated
+# GETs, hash-verified against the pin). It does not call the Modrinth API and
+# needs no secrets. Per org convention, a consumer stub that is wired to a
+# live-API-reading check should trigger on workflow_dispatch only; this
+# workflow decides nothing about triggers, the stub does.
+
+on:
+  workflow_call:
+    inputs:
+      strict:
+        description: Treat warnings (e.g. no nested jars found anywhere) as failures.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-check:
+    name: Check required mod dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: brooswit-minecraft/schematic
+          ref: v1
+          path: .schematic-tools
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check dependency closure
+        env:
+          STRICT: ${{ inputs.strict }}
+        run: |
+          args=()
+          if [ "$STRICT" = "true" ]; then args+=(--strict); fi
+          python .schematic-tools/scripts/dependency_check.py "${args[@]}"

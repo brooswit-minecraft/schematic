@@ -129,6 +129,27 @@ part.
 would break your workflow ships as a `v2` instead. If you'd rather not receive moving
 updates, pin a specific tag or commit SHA in place of `@v1` in your stub's `uses:` line.
 
+## Pre-release dependency check
+
+`reusable-dependency-check.yml` downloads every pinned `mods/*.pw.toml` file, verifies
+its hash, and fails if any mod's `type = "required"` NeoForge dependency (or legacy
+`mandatory = true`) is not provided, inside its version range, by another pinned jar or a
+nested jarjar jar. `minecraft`/`neoforge`/`java` ranges are only noted, never failed (a
+range that reads wrong can still load). It warns if no nested jars are found anywhere.
+Wire it with a thin stub (manual trigger, per the live-network convention):
+
+```yaml
+name: Dependency check
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  check:
+    uses: brooswit-minecraft/schematic/.github/workflows/reusable-dependency-check.yml@v1
+```
+
+Locally: `python3.11+ scripts/dependency_check.py`. Tests: `tests/test_dependency_check.py`.
+
 ## Template-only files
 
 Five files under `.github/workflows` are template-only, and safe to leave in place:
