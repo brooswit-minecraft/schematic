@@ -452,6 +452,11 @@ jobs:
           SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
           SERVER_BACKUP_RETENTION: ${{ inputs['backup-retention'] }}
         run: python .schematic-tools/scripts/server_deploy.py backup
+      - name: Preflight, fail fast if the server is not running
+        env:
+          SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
+          SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
+        run: python .schematic-tools/scripts/server_deploy.py preflight
       - name: Verify running server, install supervisor, and atomically upload files
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
@@ -478,6 +483,18 @@ jobs:
           SERVER_RCON_SHUTDOWN_TIMEOUT: ${{ vars.SERVER_RCON_SHUTDOWN_TIMEOUT }}
           SERVER_RCON_PASSWORD: ${{ secrets.SERVER_RCON_PASSWORD }}
         run: python .schematic-tools/scripts/server_deploy.py restart
+      - name: Print the last 50 server log lines on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          SERVER_SFTP_HOST: ${{ vars.SERVER_SFTP_HOST }}
+          SERVER_SFTP_PORT: ${{ vars.SERVER_SFTP_PORT }}
+          SERVER_SFTP_PATH: ${{ vars.SERVER_SFTP_PATH }}
+          SERVER_SFTP_USERNAME: ${{ secrets.SERVER_SFTP_USERNAME }}
+          SERVER_SFTP_PASSWORD: ${{ secrets.SERVER_SFTP_PASSWORD }}
+          SERVER_SFTP_PRIVATE_KEY: ${{ secrets.SERVER_SFTP_PRIVATE_KEY }}
+          SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
+        run: python .schematic-tools/scripts/server_deploy.py logs --tail 50
       - name: Report live deployment
         run: |
           echo 'Exact release files uploaded and Minecraft restarted through the managed startup supervisor.'
