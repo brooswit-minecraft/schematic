@@ -555,14 +555,27 @@ def connect_upload(output, env=os.environ):
         install_supervisor(sftp, env["SERVER_SFTP_PATH"])
 
 
-def deploy(output, env=os.environ):
+def deploy(output, env=os.environ, allow_stopped=False, probe=None):
     # The v1 runtime refresh preserves a running server's power state. Keep it
     # running while atomically replacing pack-owned files, then let Hosting own
     # the stop/start lifecycle in the next workflow step.
+    #
+    # allow_stopped: when the server is down (RCON does not answer), still
+    # upload the files over SFTP, which does not need the Minecraft process, so a
+    # server that crashed on a bad pack can be fixed without it running. Nothing
+    # is restarted; the operator starts it. Returns True if it was running.
     rcon_config(env)
     upload_config(env)
-    wait_until_ready(env)
+    running = True
+    if allow_stopped:
+        try:
+            (probe or preflight)(env)
+        except ServerNotRunning:
+            running = False
+    if running:
+        wait_until_ready(env)
     connect_upload(output, env)
+    return running
 
 
 # --- Pre-deploy world archive (opt-in; SCHEM-38) -----------------------------
@@ -818,12 +831,53 @@ def backup(env=os.environ, command=None, connect=None):
         caller(host, port, password, "save-on")
 
 
+class ServerNotRunning(Exception):
+    """The Minecraft server's RCON port does not answer."""
+
+
+def preflight(env, connect=socket.create_connection):
+    """Fail fast, in seconds, when the server is down, instead of timing out later.
+    Host and port are repository variables, not secrets."""
+    host = env.get("SERVER_RCON_HOST")
+    port = int(env.get("SERVER_RCON_PORT") or "25575")
+    if not host:
+        raise ValueError("SERVER_RCON_HOST is not configured")
+    try:
+        connect((host, port), timeout=10).close()
+    except OSError as error:
+        raise ServerNotRunning(f"{host}:{port}") from error
+    return f"Server answers on RCON {host}:{port}."
+
+
+_CREDENTIAL_LINE = re.compile(r"(password|passwd|token|secret|private[_-]?key|authorization)\s*[=:]", re.I)
+
+
+def tail_lines(text, count):
+    """Last `count` lines of a log, with credential-looking lines withheld."""
+    lines = text.splitlines()[-max(1, count):]
+    return ["[line withheld: looks like a credential]" if _CREDENTIAL_LINE.search(line) else line for line in lines]
+
+
+def fetch_log_tail(env, count, session=None):
+    """Read the end of logs/latest.log over the existing SFTP access. Read-only."""
+    root = env["SERVER_SFTP_PATH"].rstrip("/")
+    with (session or sftp_session)(env) as sftp:
+        path = f"{root}/logs/latest.log"
+        size = sftp.stat(path).st_size
+        with sftp.open(path, "rb") as handle:
+            handle.seek(max(0, size - 400_000))
+            text = handle.read().decode("utf-8", "replace")
+    return tail_lines(text, count)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("materialize", "deploy", "restart", "wait-ready", "wait-restarted", "backup"))
+    parser.add_argument("command", choices=("materialize", "deploy", "restart", "wait-ready", "wait-restarted", "backup", "preflight", "logs"))
     parser.add_argument("--output")
     parser.add_argument("--archive")
     parser.add_argument("--version")
+    parser.add_argument("--tail", type=int, default=50)
+    parser.add_argument("--allow-stopped", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "materialize":
@@ -835,8 +889,15 @@ def main():
         elif args.command == "deploy":
             if not args.output:
                 parser.error("deploy requires --output")
-            deploy(args.output)
-            print("Running server verified and exact release files uploaded atomically.")
+            if deploy(args.output, allow_stopped=args.allow_stopped):
+                print("Running server verified and exact release files uploaded atomically.")
+            else:
+                print("Server was NOT running: exact release files uploaded atomically over SFTP; nothing restarted. "
+                      "Start the server from the Modrinth panel.")
+        elif args.command == "preflight":
+            print(preflight(os.environ))
+        elif args.command == "logs":
+            print("\n".join(fetch_log_tail(os.environ, args.tail)))
         elif args.command == "restart":
             print(restart_and_wait(os.environ))
         elif args.command == "wait-ready":
@@ -849,6 +910,10 @@ def main():
                 print("Pruned old archives:", ", ".join(result["removed"]))
         else:
             print(wait_for_restart(os.environ))
+    except ServerNotRunning as error:
+        print(f"Server is not running: RCON {error} does not answer. Start it from the Modrinth panel, then re-run "
+              "Server update. Nothing was uploaded or changed.", file=sys.stderr)
+        return 3
     except Exception as error:
         # SSH/network exceptions may contain credentials, URLs or host details.
         print("Deployment failed (" + type(error).__name__ + "). Check RCON/SFTP configuration, pack integrity, remote ownership and pending marker.", file=sys.stderr)

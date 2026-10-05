@@ -1,3 +1,4 @@
+import contextlib
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -689,3 +690,68 @@ class DeploymentTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreflightAndLogsTest(unittest.TestCase):
+    def test_preflight_passes_when_rcon_answers(self):
+        class Conn:
+            def close(self): pass
+        message = deploy.preflight({"SERVER_RCON_HOST": "h", "SERVER_RCON_PORT": "25559"}, connect=lambda addr, timeout: Conn())
+        self.assertIn("h:25559", message)
+
+    def test_preflight_fails_fast_when_rcon_is_closed(self):
+        def refuse(addr, timeout):
+            raise TimeoutError("timed out")
+        with self.assertRaises(deploy.ServerNotRunning) as caught:
+            deploy.preflight({"SERVER_RCON_HOST": "h", "SERVER_RCON_PORT": "25559"}, connect=refuse)
+        self.assertEqual("h:25559", str(caught.exception))
+
+    def test_preflight_requires_a_host(self):
+        with self.assertRaises(ValueError):
+            deploy.preflight({})
+
+    def test_tail_lines_keeps_the_end_and_withholds_credentials(self):
+        text = "\n".join(["a", "b", "rcon.password=hunter2", "d"])
+        self.assertEqual(["[line withheld: looks like a credential]", "d"], deploy.tail_lines(text, 2))
+        self.assertEqual(["a", "b", "[line withheld: looks like a credential]", "d"], deploy.tail_lines(text, 50))
+
+    def test_fetch_log_tail_reads_only_the_log(self):
+        data = b"one\ntwo\nthree\n"
+        class Handle:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def seek(self, n): self.n = n
+            def read(self): return data
+        class Sftp:
+            opened = []
+            def stat(self, path): return SimpleNamespace(st_size=len(data))
+            def open(self, path, mode): Sftp.opened.append((path, mode)); return Handle()
+        @contextlib.contextmanager
+        def session(env): yield Sftp()
+        lines = deploy.fetch_log_tail({"SERVER_SFTP_PATH": "/srv/"}, 2, session=session)
+        self.assertEqual(["two", "three"], lines)
+        self.assertEqual([("/srv/logs/latest.log", "rb")], Sftp.opened)
+
+
+class AllowStoppedTest(unittest.TestCase):
+    ENV = {"SERVER_RCON_HOST": "h", "SERVER_RCON_PORT": "1", "SERVER_RCON_PASSWORD": "x",
+           "SERVER_SFTP_HOST": "s", "SERVER_SFTP_USERNAME": "u", "SERVER_SFTP_PATH": "/", "SERVER_SFTP_KNOWN_HOSTS": "k",
+           "SERVER_SFTP_PASSWORD": "p"}
+
+    def run_deploy(self, allow_stopped, running):
+        def probe(env):
+            if not running:
+                raise deploy.ServerNotRunning("h:1")
+        with mock.patch.object(deploy, "wait_until_ready") as ready, mock.patch.object(deploy, "connect_upload") as upload:
+            result = deploy.deploy("out", self.ENV, allow_stopped=allow_stopped, probe=probe)
+        return result, ready.called, upload.called
+
+    def test_running_server_waits_for_ready_then_uploads(self):
+        self.assertEqual((True, True, True), self.run_deploy(True, True))
+
+    def test_stopped_server_still_uploads_but_does_not_wait_when_allowed(self):
+        self.assertEqual((False, False, True), self.run_deploy(True, False))
+
+    def test_without_the_flag_behaviour_is_unchanged(self):
+        # No probe at all: wait_until_ready decides, as before.
+        self.assertEqual((True, True, True), self.run_deploy(False, False))
