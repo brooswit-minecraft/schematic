@@ -731,3 +731,27 @@ class PreflightAndLogsTest(unittest.TestCase):
         lines = deploy.fetch_log_tail({"SERVER_SFTP_PATH": "/srv/"}, 2, session=session)
         self.assertEqual(["two", "three"], lines)
         self.assertEqual([("/srv/logs/latest.log", "rb")], Sftp.opened)
+
+
+class AllowStoppedTest(unittest.TestCase):
+    ENV = {"SERVER_RCON_HOST": "h", "SERVER_RCON_PORT": "1", "SERVER_RCON_PASSWORD": "x",
+           "SERVER_SFTP_HOST": "s", "SERVER_SFTP_USERNAME": "u", "SERVER_SFTP_PATH": "/", "SERVER_SFTP_KNOWN_HOSTS": "k",
+           "SERVER_SFTP_PASSWORD": "p"}
+
+    def run_deploy(self, allow_stopped, running):
+        def probe(env):
+            if not running:
+                raise deploy.ServerNotRunning("h:1")
+        with mock.patch.object(deploy, "wait_until_ready") as ready, mock.patch.object(deploy, "connect_upload") as upload:
+            result = deploy.deploy("out", self.ENV, allow_stopped=allow_stopped, probe=probe)
+        return result, ready.called, upload.called
+
+    def test_running_server_waits_for_ready_then_uploads(self):
+        self.assertEqual((True, True, True), self.run_deploy(True, True))
+
+    def test_stopped_server_still_uploads_but_does_not_wait_when_allowed(self):
+        self.assertEqual((False, False, True), self.run_deploy(True, False))
+
+    def test_without_the_flag_behaviour_is_unchanged(self):
+        # No probe at all: wait_until_ready decides, as before.
+        self.assertEqual((True, True, True), self.run_deploy(False, False))

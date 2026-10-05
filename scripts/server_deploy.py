@@ -555,14 +555,27 @@ def connect_upload(output, env=os.environ):
         install_supervisor(sftp, env["SERVER_SFTP_PATH"])
 
 
-def deploy(output, env=os.environ):
+def deploy(output, env=os.environ, allow_stopped=False, probe=None):
     # The v1 runtime refresh preserves a running server's power state. Keep it
     # running while atomically replacing pack-owned files, then let Hosting own
     # the stop/start lifecycle in the next workflow step.
+    #
+    # allow_stopped: when the server is down (RCON does not answer), still
+    # upload the files over SFTP, which does not need the Minecraft process, so a
+    # server that crashed on a bad pack can be fixed without it running. Nothing
+    # is restarted; the operator starts it. Returns True if it was running.
     rcon_config(env)
     upload_config(env)
-    wait_until_ready(env)
+    running = True
+    if allow_stopped:
+        try:
+            (probe or preflight)(env)
+        except ServerNotRunning:
+            running = False
+    if running:
+        wait_until_ready(env)
     connect_upload(output, env)
+    return running
 
 
 # --- Pre-deploy world archive (opt-in; SCHEM-38) -----------------------------
@@ -864,6 +877,7 @@ def main():
     parser.add_argument("--archive")
     parser.add_argument("--version")
     parser.add_argument("--tail", type=int, default=50)
+    parser.add_argument("--allow-stopped", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "materialize":
@@ -875,8 +889,11 @@ def main():
         elif args.command == "deploy":
             if not args.output:
                 parser.error("deploy requires --output")
-            deploy(args.output)
-            print("Running server verified and exact release files uploaded atomically.")
+            if deploy(args.output, allow_stopped=args.allow_stopped):
+                print("Running server verified and exact release files uploaded atomically.")
+            else:
+                print("Server was NOT running: exact release files uploaded atomically over SFTP; nothing restarted. "
+                      "Start the server from the Modrinth panel.")
         elif args.command == "preflight":
             print(preflight(os.environ))
         elif args.command == "logs":

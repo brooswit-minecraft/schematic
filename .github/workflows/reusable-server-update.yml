@@ -68,6 +68,16 @@ on:
           `ref` input.
         required: false
         type: string
+      allow-stopped:
+        description: >-
+          When true on the sftp route, a server whose RCON does not answer
+          still gets the exact release files uploaded over SFTP (which needs
+          no running Minecraft process) and is not restarted; the operator
+          starts it. Use it so a server that crashed on a bad pack can be
+          repaired. Default false: a stopped server fails fast instead.
+        required: false
+        default: false
+        type: boolean
       backup:
         description: >-
           SCHEM-38: when true on the sftp route, archives the world
@@ -453,6 +463,8 @@ jobs:
           SERVER_BACKUP_RETENTION: ${{ inputs['backup-retention'] }}
         run: python .schematic-tools/scripts/server_deploy.py backup
       - name: Preflight, fail fast if the server is not running
+        id: preflight
+        continue-on-error: ${{ inputs.allow-stopped }}
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
           SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
@@ -470,13 +482,14 @@ jobs:
           SERVER_SFTP_PASSWORD: ${{ secrets.SERVER_SFTP_PASSWORD }}
           SERVER_SFTP_PRIVATE_KEY: ${{ secrets.SERVER_SFTP_PRIVATE_KEY }}
           SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
-        run: python .schematic-tools/scripts/server_deploy.py deploy --output "$RUNNER_TEMP/server-files"
+        run: python .schematic-tools/scripts/server_deploy.py deploy --output "$RUNNER_TEMP/server-files" ${{ inputs.allow-stopped && '--allow-stopped' || '' }}
       - name: Configure repository-managed startup supervisor
         env:
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
           SERVER_ID: ${{ vars.MODRINTH_SERVER_ID }}
         run: bunx --bun github:brooswit-minecraft/rinth#v0.10.0 servers startup "$SERVER_ID" --command './.schematic-supervisor.sh' --json
       - name: Save, restart, and verify Minecraft through RCON
+        if: steps.preflight.outcome != 'failure'
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
           SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
@@ -497,5 +510,10 @@ jobs:
         run: python .schematic-tools/scripts/server_deploy.py logs --tail 50
       - name: Report live deployment
         run: |
-          echo 'Exact release files uploaded and Minecraft restarted through the managed startup supervisor.'
-          echo 'SFTP deployment complete: live preflight, atomic upload, clean RCON restart, and readiness verification succeeded.' >> "$GITHUB_STEP_SUMMARY"
+          if [ '${{ steps.preflight.outcome }}' = 'failure' ]; then
+            echo 'Server was NOT running: exact release files uploaded over SFTP, nothing restarted. Start the server from the Modrinth panel.'
+            echo 'SFTP upload complete while the server was stopped; start it from the Modrinth panel.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Exact release files uploaded and Minecraft restarted through the managed startup supervisor.'
+            echo 'SFTP deployment complete: live preflight, atomic upload, clean RCON restart, and readiness verification succeeded.' >> "$GITHUB_STEP_SUMMARY"
+          fi
