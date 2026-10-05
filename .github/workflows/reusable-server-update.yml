@@ -68,6 +68,15 @@ on:
           `ref` input.
         required: false
         type: string
+      tools-ref:
+        description: >-
+          Ref of this repository (schematic) to take the deploy scripts from.
+          Default v1, which is byte-for-byte today's behaviour. A caller that
+          pins this workflow by commit SHA should pass the same SHA here so the
+          workflow and its scripts agree.
+        required: false
+        default: v1
+        type: string
       allow-stopped:
         description: >-
           When true on the sftp route, a server whose RCON does not answer
@@ -364,7 +373,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: brooswit-minecraft/schematic
-          ref: v1
+          ref: ${{ inputs.tools-ref }}
           path: .schematic-tools
           persist-credentials: false
       - uses: actions/setup-python@v5
