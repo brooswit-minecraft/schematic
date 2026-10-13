@@ -52,7 +52,9 @@ class FakeSFTP:
         self.path(path).unlink()
 
     def open(self, path, mode):
-        return self.path(path).open("xb" if mode == "wx" else mode)
+        handle = self.path(path).open("xb" if mode == "wx" else mode)
+        handle.prefetch = lambda size, max_concurrent_requests: None
+        return handle
 
     def put(self, source, target):
         shutil.copyfile(source, self.path(target))
@@ -101,6 +103,36 @@ class FakeRCONSocket:
 
 
 class DeploymentTest(unittest.TestCase):
+    def test_remote_hash_pipelines_reads_and_preserves_digest(self):
+        data = b"server mod content" * 65536
+        source = io.BytesIO(data)
+        source.prefetch = mock.Mock()
+        sftp = mock.Mock()
+        sftp.open.return_value = source
+        sftp.lstat.return_value = SimpleNamespace(st_size=len(data))
+        self.assertEqual(deploy.remote_hash(sftp, "/mods/example.jar"), hashlib.sha512(data).hexdigest())
+        source.prefetch.assert_called_once_with(len(data), max_concurrent_requests=32)
+
+    def test_remote_hash_rejects_oversized_file_before_prefetch(self):
+        source = io.BytesIO(b"unexpected")
+        source.prefetch = mock.Mock()
+        sftp = mock.Mock()
+        sftp.open.return_value = source
+        sftp.lstat.return_value = SimpleNamespace(st_size=deploy.MAX_FILE + 1)
+        with self.assertRaisesRegex(ValueError, "verification limit"):
+            deploy.remote_hash(sftp, "/mods/example.jar")
+        source.prefetch.assert_not_called()
+
+    def test_remote_hash_still_rejects_growth_after_stat(self):
+        source = io.BytesIO(b"grown")
+        source.prefetch = mock.Mock()
+        sftp = mock.Mock()
+        sftp.open.return_value = source
+        sftp.lstat.return_value = SimpleNamespace(st_size=1)
+        with mock.patch.object(deploy, "MAX_FILE", 4):
+            with self.assertRaisesRegex(ValueError, "verification limit"):
+                deploy.remote_hash(sftp, "/mods/example.jar")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

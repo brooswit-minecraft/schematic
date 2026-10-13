@@ -411,6 +411,14 @@ def read_manifest(sftp, path):
 
 def remote_hash(sftp, path):
     with sftp.open(path, "rb") as source:
+        size = sftp.lstat(path).st_size
+        if size > MAX_FILE:
+            raise ValueError("Remote file exceeds verification limit")
+        # Paramiko splits reads into 32 KiB requests. Without prefetch each
+        # request waits a network round trip, exhausting the deployment job's
+        # timeout while verifying otherwise healthy large mod jars. Bound the
+        # pipeline, and retain the streaming size limit and full SHA-512 check.
+        source.prefetch(size, max_concurrent_requests=32)
         return file_hash(source)
 
 
