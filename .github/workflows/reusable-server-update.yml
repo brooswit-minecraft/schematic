@@ -68,6 +68,16 @@ on:
           `ref` input.
         required: false
         type: string
+      tools-ref:
+        description: Ref of schematic containing deployment scripts; pin to the workflow revision.
+        required: false
+        default: v1
+        type: string
+      server-address:
+        description: Explicit host:port for the verified deployment receipt; empty disables receipt publication.
+        required: false
+        default: ''
+        type: string
       allow-stopped:
         description: >-
           When true on the sftp route, a server whose RCON does not answer
@@ -364,7 +374,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: brooswit-minecraft/schematic
-          ref: v1
+          ref: ${{ inputs.tools-ref }}
           path: .schematic-tools
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -489,6 +499,7 @@ jobs:
           SERVER_ID: ${{ vars.MODRINTH_SERVER_ID }}
         run: bunx --bun github:brooswit-minecraft/rinth#v0.10.0 servers startup "$SERVER_ID" --command './.schematic-supervisor.sh' --json
       - name: Save, restart, and verify Minecraft through RCON
+        id: restart
         if: steps.preflight.outcome != 'failure'
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
@@ -496,6 +507,24 @@ jobs:
           SERVER_RCON_SHUTDOWN_TIMEOUT: ${{ vars.SERVER_RCON_SHUTDOWN_TIMEOUT }}
           SERVER_RCON_PASSWORD: ${{ secrets.SERVER_RCON_PASSWORD }}
         run: python .schematic-tools/scripts/server_deploy.py restart
+      - name: Bind verified readiness to the deployed release
+        if: inputs.server-address != '' && steps.restart.outcome == 'success'
+        env:
+          GAME_SERVER_ADDRESS: ${{ inputs.server-address }}
+          RESTART_OUTCOME: ${{ steps.restart.outcome }}
+        run: |
+          mapfile -d '' packs < <(find "$RUNNER_TEMP/server-release" -maxdepth 1 -type f -name '*.mrpack' -print0)
+          test "${#packs[@]}" -eq 1
+          python .schematic-tools/scripts/deployment_receipt.py \
+            --archive "${packs[0]}" --manifest "$RUNNER_TEMP/server-files/.schematic-deploy.json" \
+            --server "$GAME_SERVER_ADDRESS" --output "$RUNNER_TEMP/server-compatibility.json"
+      - name: Publish verified server compatibility
+        if: inputs.server-address != '' && steps.restart.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-compatibility
+          path: ${{ runner.temp }}/server-compatibility.json
+          if-no-files-found: error
       - name: Print the last 50 server log lines on failure
         if: failure()
         continue-on-error: true
