@@ -313,6 +313,7 @@ class RealProtocolBackupEvidenceTest(unittest.TestCase):
         }
 
     def test_backup_end_to_end_over_real_sftp_and_rcon_protocols(self):
+        self.fail("deliberate CI evidence failure")
         world = self.remote_root / "server/world"
         world.mkdir()
         (world / "level.dat").write_bytes(b"leveldata")
