@@ -145,9 +145,9 @@ permissions:
   contents: read
 jobs:
   check:
-    # Pin to an immutable tag or full commit SHA whose workflow carries the fixed
-    # checker ref (not the moving @v1) so the gate itself is reproducible.
-    uses: brooswit-minecraft/schematic/.github/workflows/reusable-dependency-check.yml@<tag-or-commit-sha>
+    # Immutable pin: the reviewed workflow commit, which itself checks the checker
+    # out at b64567618fcc400f156de4701eb4ffc25de0d672. Not the moving @v1.
+    uses: brooswit-minecraft/schematic/.github/workflows/reusable-dependency-check.yml@07834cf1258a1d0c4e56069a4e7e57ad701210e7
 ```
 
 The workflow checks the checker script out at a fixed commit SHA, not a moving tag, so a
