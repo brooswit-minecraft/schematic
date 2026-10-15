@@ -250,10 +250,21 @@ def analyze(jars, versions=None):
                     row["status"] = "missing"
                     row["detail"] = "[MISSING]"
                 else:
-                    ok = [p for p in found if p[0] is None or in_range(p[0], d["range"])]
+                    # An unknown provider version (unresolved placeholder, no manifest
+                    # version) can only satisfy an unconstrained requirement; against
+                    # a constrained range it is unverifiable, never a pass.
+                    constrained = bool((d["range"] or "").strip())
+                    ok = [p for p in found
+                          if (p[0] is not None and in_range(p[0], d["range"]))
+                          or (p[0] is None and not constrained)]
+                    unknown = [p for p in found if p[0] is None]
                     if ok:
                         row["status"] = "satisfied"
                         row["detail"] = f"{ok[0][0] or 'unknown version'} from {ok[0][1]}"
+                    elif unknown:
+                        row["status"] = "unverified"
+                        row["detail"] = ("provider version unknown, cannot verify range: "
+                                         + ", ".join(f"{p[0] or 'unknown'} ({p[1]})" for p in found))
                     else:
                         row["status"] = "version"
                         row["detail"] = "have " + ", ".join(f"{p[0]} ({p[1]})" for p in found)
@@ -277,7 +288,8 @@ def run(mods_dir, pack_toml, fetch=download, out=print, strict=False):
     for r in rows:
         if r["status"] == "platform":
             continue
-        tag = {"satisfied": "OK   ", "missing": "FAIL ", "version": "FAIL "}[r["status"]]
+        tag = {"satisfied": "OK   ", "missing": "FAIL ", "version": "FAIL ",
+               "unverified": "FAIL "}[r["status"]]
         out(f"{tag} {r['owner']} ({r['jar']}) requires {r['dep']} {r['range'] or '*'}: "
             f"{r['status'].upper()} - {r['detail']}")
         failures += r["status"] != "satisfied"

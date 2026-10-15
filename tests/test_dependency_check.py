@@ -141,6 +141,28 @@ class ClosureTests(unittest.TestCase):
         rows, _ = rows_by_dep([a, b])
         self.assertEqual(rows["b"]["status"], "satisfied")
 
+    def test_unknown_version_cannot_satisfy_constrained_range(self):
+        # Realistic shape: unresolved ${file.jarVersion} placeholder, no manifest
+        # version, so the provider's version is unknown. It must not pass [2,).
+        a = make_jar("a", deps=[("b", "[2,)", "required")])
+        b = make_jar("b", "${file.jarVersion}")
+        rows, _ = rows_by_dep([a, b])
+        self.assertEqual(rows["b"]["status"], "unverified")
+        self.assertIn("unknown", rows["b"]["detail"])
+
+    def test_unknown_version_satisfies_unconstrained_dep(self):
+        a = make_jar("a", deps=[("b", "", "required")])
+        b = make_jar("b", "${file.jarVersion}")
+        rows, _ = rows_by_dep([a, b])
+        self.assertEqual(rows["b"]["status"], "satisfied")
+
+    def test_known_in_range_provider_wins_over_unknown_one(self):
+        a = make_jar("a", deps=[("b", "[2,)", "required")])
+        b1 = make_jar("b", "${file.jarVersion}")
+        b2 = make_jar("b", "2.5")
+        rows, _ = rows_by_dep([a, b1, b2])
+        self.assertEqual(rows["b"]["status"], "satisfied")
+
     def test_jar_without_metadata_is_tolerated(self):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
