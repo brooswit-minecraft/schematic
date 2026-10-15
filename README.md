@@ -148,6 +148,10 @@ jobs:
     uses: brooswit-minecraft/schematic/.github/workflows/reusable-dependency-check.yml@v1
 ```
 
+The workflow checks the checker script out at a fixed commit SHA, not a moving tag, so a
+consumer's `uses:` pin and the checker code it runs are both immutable; pin the `uses:` line to
+a tag/SHA whose workflow file carries that same checker SHA.
+
 Locally: `python3.11+ scripts/dependency_check.py`. Tests: `tests/test_dependency_check.py`.
 
 ## Template-only files
