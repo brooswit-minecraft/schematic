@@ -136,13 +136,22 @@ class ConsumerWithoutHelperCanRunIt(unittest.TestCase):
         # schematic-ref" step: a ref that resolves but predates the helper
         # (like today's v1 tag) must be caught by a file-existence check,
         # not produce a confusing traceback from the next step.
+        #
+        # Built as an independent, from-scratch repo (not by walking this
+        # repo's own history) so the case holds regardless of whether this
+        # test itself runs against a full or a shallow/single-commit
+        # checkout of schematic (e.g. CI's default actions/checkout depth).
+        no_helper_origin = Path(self.tmp.name) / "no-helper-origin"
+        no_helper_origin.mkdir()
+        git("init", "--quiet", str(no_helper_origin))
+        git("config", "user.email", "test@example.invalid", cwd=no_helper_origin)
+        git("config", "user.name", "test", cwd=no_helper_origin)
+        (no_helper_origin / "README.md").write_text("pre-helper schematic\n")
+        git("add", "README.md", cwd=no_helper_origin)
+        git("commit", "--quiet", "-m", "commit predating the helper", cwd=no_helper_origin)
+
         mechanism_dir = self.consumer / ".schematic-mechanism"
-        git("clone", "--quiet", str(REPO_ROOT), str(mechanism_dir))
-        # The first commit in this repo's history predates this helper.
-        root_commit = git(
-            "rev-list", "--max-parents=0", "HEAD", cwd=mechanism_dir
-        ).stdout.strip().splitlines()[0]
-        git("checkout", "--quiet", root_commit, cwd=mechanism_dir)
+        git("clone", "--quiet", str(no_helper_origin), str(mechanism_dir))
         self.assertFalse((mechanism_dir / "scripts" / "release_state.py").exists())
 
 
