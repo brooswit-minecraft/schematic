@@ -20,6 +20,12 @@ import urllib.request
 import uuid
 import zipfile
 
+# Sibling module, not installed as a package; resolve relative to this
+# file (works both for direct script execution and for tests that load
+# this module via importlib.util.spec_from_file_location).
+sys.path.insert(0, str(Path(__file__).parent))
+import deploy_state
+
 
 MANIFEST = ".schematic-deploy.json"
 PENDING = ".schematic-deploy-pending"
@@ -422,11 +428,37 @@ def remote_hash(sftp, path):
         return file_hash(source)
 
 
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def verify_installed_content(sftp, root, manifest):
+    """Read back the live, already-promoted files named in `manifest` and
+    re-verify each one's SHA-512 against the manifest's recorded digest.
+    Distinct from the staging-time check in upload() below, which verifies
+    the STAGED copy before it is renamed into place; this verifies what is
+    actually installed at the final path afterwards (MINECRAFT-40
+    acceptance criterion 4: read back the exact installed content, not
+    just trust a successful write)."""
+    for path, digest in manifest["files"].items():
+        safe_path(path)
+        target = root + "/" + path
+        if not regular(sftp, target):
+            raise ValueError("Installed file missing after promotion: " + path)
+        if remote_hash(sftp, target) != digest:
+            raise ValueError("Installed file does not match the release manifest after promotion: " + path)
+
+
 def upload(sftp, output, root):
     if not root.startswith("/") or any(p in (".", "..") for p in root.split("/")) or "\\" in root:
         raise ValueError("SFTP path must be an absolute server directory")
     root = root.rstrip("/")
     directory(sftp, root or "/")
+    output = Path(output)
+    new = json.loads((output / MANIFEST).read_text())
+    # MINECRAFT-40: refuse an older (or stale-duplicate) release over one
+    # already live/updating, before the pending marker or any file moves.
+    deploy_state.guard_stale_release(sftp, root, new["version"])
     if attributes(sftp, root + "/" + PENDING):
         raise ValueError("Incomplete deployment marker exists; inspect/restore server before retrying")
     stage = root + "/.schematic-stage-" + uuid.uuid4().hex
@@ -434,8 +466,6 @@ def upload(sftp, output, root):
     # A failure retains this marker for operator inspection, never blind retry.
     with sftp.open(root + "/" + PENDING, "wx") as marker:
         marker.write(stage.encode())
-    output = Path(output)
-    new = json.loads((output / MANIFEST).read_text())
     old = read_manifest(sftp, root + "/" + MANIFEST)
     for path, digest in new["files"].items():
         safe_path(path)
@@ -471,6 +501,13 @@ def upload(sftp, output, root):
             digest = remote_hash(sftp, target)
             if digest not in (old["files"].get(path), new["files"].get(path)):
                 raise ValueError("Remote file differs from managed/desired content; refusing overwrite")
+    # MINECRAFT-40: the first mutation that actually touches pack-owned
+    # live content. All read-only validation above (stale-release guard,
+    # local-file-changed check, untracked-mods check, existing-file safety
+    # check) has already passed, so this is the right point to durably
+    # record UPDATING — not earlier, which would make this a mutation that
+    # happens even when validation goes on to reject the deploy.
+    deploy_state.write_state(sftp, root, new["version"], deploy_state.UPDATING, now=utcnow)
     sftp.mkdir(stage)
     # Probe atomic overwrite support before touching live pack files.
     for name in ("probe-a", "probe-b"):
@@ -493,6 +530,15 @@ def upload(sftp, output, root):
         target = root + "/" + path
         if regular(sftp, target):
             sftp.remove(target)
+    # MINECRAFT-40: re-read back every promoted file at its LIVE path and
+    # re-hash it, rather than trusting that the staged-copy verification
+    # above (remote_hash on the .schematic-stage-* copy, before rename)
+    # still describes what ended up at the live path after posix_rename.
+    # A successful rename is not itself proof the live file is correct.
+    # Left unverified while the PENDING marker is still present, so a
+    # failure here retains it for operator inspection like any other
+    # failure in this function.
+    verify_installed_content(sftp, root, new)
     sftp.posix_rename(stage + "/" + MANIFEST, root + "/" + MANIFEST)
     sftp.remove(root + "/" + PENDING)
     for path in sorted({str(PurePosixPath(p).parent) for p in new["files"]}, key=len, reverse=True):
@@ -561,6 +607,108 @@ def connect_upload(output, env=os.environ):
     with sftp_session(env) as sftp:
         upload(sftp, output, env["SERVER_SFTP_PATH"])
         install_supervisor(sftp, env["SERVER_SFTP_PATH"])
+
+
+def connect_mark_requested(output, env=os.environ):
+    """Record REQUESTED for the version already materialized at `output`,
+    after the same stale-release guard upload() itself re-checks later —
+    run as the EARLIEST SFTP-touching step in the sftp route, before the
+    world backup or RCON preflight, so a release that is already stale
+    fails fast without first archiving the world or probing RCON for a
+    deploy that guard_stale_release is about to refuse anyway."""
+    new = json.loads((Path(output) / MANIFEST).read_text())
+    with sftp_session(env) as sftp:
+        root = env["SERVER_SFTP_PATH"]
+        deploy_state.guard_stale_release(sftp, root, new["version"])
+        return deploy_state.write_state(sftp, root, new["version"], deploy_state.REQUESTED, now=utcnow)
+
+
+def live_manifest_version(sftp, root):
+    """The version on the currently-promoted live manifest, or None.
+    Deliberately NOT the deploy-state record's own version: that record
+    names whichever attempt last wrote it, which by the time a failure
+    or rollback handler runs may belong to an entirely different,
+    unrelated run (flagged in PR #63 review — see connect_mark_failed and
+    connect_mark_rolled_back below). The live manifest instead names
+    whatever this server's pack files actually, currently are — the one
+    unambiguous fallback when no version is given explicitly."""
+    manifest = read_manifest(sftp, root.rstrip("/") + "/" + MANIFEST)
+    version = manifest.get("version")
+    return version if isinstance(version, str) else None
+
+
+def connect_mark_healthy(env=os.environ):
+    """After a verified restart, record HEALTHY against whichever version
+    is actually live (read back from the promoted manifest on the server,
+    not whatever the caller thinks it just deployed)."""
+    with sftp_session(env) as sftp:
+        root = env["SERVER_SFTP_PATH"]
+        version = live_manifest_version(sftp, root)
+        if version is None:
+            raise ValueError("Cannot mark healthy: live manifest has no release version on record")
+        return deploy_state.write_state(sftp, root, version, deploy_state.HEALTHY, now=utcnow)
+
+
+def connect_mark_failed(env=os.environ, version=None):
+    """Record FAILED for `version`, or — when not given — for whatever
+    version is on the LIVE manifest. Both of this fallback's real callers
+    (a restart-command failure, or the job-level catch-all workflow step)
+    only ever run after `deploy` has already succeeded in the SAME job,
+    so the live manifest at that point is guaranteed to be THIS run's own
+    candidate, not some other run's — unlike the deploy-state record's
+    current attempt, which the fallback deliberately does not read (see
+    live_manifest_version's docstring)."""
+    with sftp_session(env) as sftp:
+        root = env["SERVER_SFTP_PATH"]
+        target_version = version or live_manifest_version(sftp, root)
+        if not target_version:
+            raise ValueError("Cannot mark failed: no candidate version given and the live manifest has none on record")
+        return deploy_state.write_state(sftp, root, target_version, deploy_state.FAILED, now=utcnow)
+
+
+def connect_mark_rolled_back(env=os.environ, version=None):
+    """Record ROLLED_BACK for `version`, or — when not given — for the
+    live manifest's version (the same unambiguous fallback as
+    connect_mark_failed, for the same reason). Recording only — this
+    performs no live rollback action itself; rollback execution is not
+    authorized/implemented here."""
+    with sftp_session(env) as sftp:
+        root = env["SERVER_SFTP_PATH"]
+        target_version = version or live_manifest_version(sftp, root)
+        if not target_version:
+            raise ValueError("Cannot mark rolled back: no candidate version given and the live manifest has none on record")
+        return deploy_state.write_state(sftp, root, target_version, deploy_state.ROLLED_BACK, now=utcnow)
+
+
+def mark_failed_best_effort(env, output_dir=None):
+    """Attempt to durably record FAILED after an exception in the
+    deploy/restart CLI paths. Purely best-effort evidence: any secondary
+    failure here (missing SFTP config, connection already dead, server
+    never got far enough to accept any state record) is swallowed so it
+    never masks the original error the caller is already re-raising."""
+    try:
+        version = None
+        if output_dir:
+            manifest_path = Path(output_dir) / MANIFEST
+            if manifest_path.exists():
+                version = json.loads(manifest_path.read_text()).get("version")
+        connect_mark_failed(env, version=version)
+    except Exception:
+        pass
+
+
+def restart_and_mark_healthy(env=os.environ):
+    """restart_and_wait(), then record HEALTHY — skipped silently when
+    SFTP is not configured for this env, so a consumer that calls the
+    `restart` command without SFTP context (not the sftp-route workflow)
+    keeps today's behaviour exactly."""
+    result = restart_and_wait(env)
+    try:
+        upload_config(env)
+    except ValueError:
+        return result
+    connect_mark_healthy(env)
+    return result
 
 
 def deploy(output, env=os.environ, allow_stopped=False, probe=None):
@@ -880,7 +1028,9 @@ def fetch_log_tail(env, count, session=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("materialize", "deploy", "restart", "wait-ready", "wait-restarted", "backup", "preflight", "logs"))
+    parser.add_argument("command", choices=("materialize", "deploy", "restart", "wait-ready", "wait-restarted",
+                                             "backup", "preflight", "logs",
+                                             "mark-requested", "mark-healthy", "mark-failed", "mark-rolled-back"))
     parser.add_argument("--output")
     parser.add_argument("--archive")
     parser.add_argument("--version")
@@ -897,7 +1047,12 @@ def main():
         elif args.command == "deploy":
             if not args.output:
                 parser.error("deploy requires --output")
-            if deploy(args.output, allow_stopped=args.allow_stopped):
+            try:
+                running = deploy(args.output, allow_stopped=args.allow_stopped)
+            except Exception:
+                mark_failed_best_effort(os.environ, args.output)
+                raise
+            if running:
                 print("Running server verified and exact release files uploaded atomically.")
             else:
                 print("Server was NOT running: exact release files uploaded atomically over SFTP; nothing restarted. "
@@ -907,7 +1062,21 @@ def main():
         elif args.command == "logs":
             print("\n".join(fetch_log_tail(os.environ, args.tail)))
         elif args.command == "restart":
-            print(restart_and_wait(os.environ))
+            try:
+                print(restart_and_mark_healthy(os.environ))
+            except Exception:
+                mark_failed_best_effort(os.environ)
+                raise
+        elif args.command == "mark-requested":
+            if not args.output:
+                parser.error("mark-requested requires --output")
+            print(connect_mark_requested(args.output))
+        elif args.command == "mark-healthy":
+            print(connect_mark_healthy(os.environ))
+        elif args.command == "mark-failed":
+            print(connect_mark_failed(os.environ, version=args.version))
+        elif args.command == "mark-rolled-back":
+            print(connect_mark_rolled_back(os.environ, version=args.version))
         elif args.command == "wait-ready":
             print(wait_until_ready(os.environ))
         elif args.command == "backup":

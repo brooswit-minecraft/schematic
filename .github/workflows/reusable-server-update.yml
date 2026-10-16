@@ -441,6 +441,23 @@ jobs:
           if [ "${#packs[@]}" -ne 1 ]; then echo '::error::Expected exactly one release pack'; exit 1; fi
           python .schematic-tools/scripts/server_deploy.py materialize \
             --archive "${packs[0]}" --version "${tag#v}" --output "$RUNNER_TEMP/server-files"
+      # MINECRAFT-40: the stale-release ordering guard, checked as early as
+      # possible — before the (optional) world backup and the RCON
+      # preflight below — so a release that arrives out of order (an older
+      # retried/delayed run racing a newer one that already deployed)
+      # fails fast instead of archiving the world or probing RCON for a
+      # deploy that is refused anyway. Also records the durable REQUESTED
+      # state. See scripts/deploy_state.py.
+      - name: Guard against a stale/out-of-order release, and record it as requested
+        env:
+          SERVER_SFTP_HOST: ${{ vars.SERVER_SFTP_HOST }}
+          SERVER_SFTP_PORT: ${{ vars.SERVER_SFTP_PORT }}
+          SERVER_SFTP_PATH: ${{ vars.SERVER_SFTP_PATH }}
+          SERVER_SFTP_USERNAME: ${{ secrets.SERVER_SFTP_USERNAME }}
+          SERVER_SFTP_PASSWORD: ${{ secrets.SERVER_SFTP_PASSWORD }}
+          SERVER_SFTP_PRIVATE_KEY: ${{ secrets.SERVER_SFTP_PRIVATE_KEY }}
+          SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
+        run: python .schematic-tools/scripts/server_deploy.py mark-requested --output "$RUNNER_TEMP/server-files"
       # SCHEM-38: opt-in world archive, over the SAME SFTP access already
       # used for pack files. Runs BEFORE the "Verify running server, install
       # supervisor, and atomically upload files" step below — that ordering
@@ -480,6 +497,7 @@ jobs:
           SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
         run: python .schematic-tools/scripts/server_deploy.py preflight
       - name: Verify running server, install supervisor, and atomically upload files
+        id: deploy
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
           SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
@@ -506,6 +524,16 @@ jobs:
           SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
           SERVER_RCON_SHUTDOWN_TIMEOUT: ${{ vars.SERVER_RCON_SHUTDOWN_TIMEOUT }}
           SERVER_RCON_PASSWORD: ${{ secrets.SERVER_RCON_PASSWORD }}
+          # MINECRAFT-40: lets `restart` durably record HEALTHY (read back
+          # from the live manifest) once RCON confirms the restart, over
+          # the same SFTP access already used for the upload above.
+          SERVER_SFTP_HOST: ${{ vars.SERVER_SFTP_HOST }}
+          SERVER_SFTP_PORT: ${{ vars.SERVER_SFTP_PORT }}
+          SERVER_SFTP_PATH: ${{ vars.SERVER_SFTP_PATH }}
+          SERVER_SFTP_USERNAME: ${{ secrets.SERVER_SFTP_USERNAME }}
+          SERVER_SFTP_PASSWORD: ${{ secrets.SERVER_SFTP_PASSWORD }}
+          SERVER_SFTP_PRIVATE_KEY: ${{ secrets.SERVER_SFTP_PRIVATE_KEY }}
+          SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
         run: python .schematic-tools/scripts/server_deploy.py restart
       - name: Bind verified readiness to the deployed release
         if: inputs.server-address != '' && steps.restart.outcome == 'success'
@@ -537,6 +565,32 @@ jobs:
           SERVER_SFTP_PRIVATE_KEY: ${{ secrets.SERVER_SFTP_PRIVATE_KEY }}
           SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
         run: python .schematic-tools/scripts/server_deploy.py logs --tail 50
+      # MINECRAFT-40: catches a failure between a successful `deploy` step
+      # and a successful `restart` step (e.g. the supervisor-configuration
+      # step above) that neither of those two steps' own best-effort
+      # mark-failed handling would see. Gated on `deploy` itself having
+      # succeeded: `mark-failed`'s no-version fallback resolves to the
+      # LIVE manifest's version (see live_manifest_version's docstring),
+      # which is only guaranteed to be THIS run's own candidate once
+      # `deploy` has already promoted it — a failure any earlier (e.g.
+      # resolving/downloading the release) must NOT fall into this step,
+      # or it would mislabel the previous, unrelated release as failed.
+      # Best-effort itself beyond that: a job that failed before any SFTP
+      # config was even usable leaves no durable record, which is fine —
+      # the job's own failed conclusion is already the evidence for that
+      # case.
+      - name: Record a failed deployment state, best-effort
+        if: failure() && steps.deploy.outcome == 'success'
+        continue-on-error: true
+        env:
+          SERVER_SFTP_HOST: ${{ vars.SERVER_SFTP_HOST }}
+          SERVER_SFTP_PORT: ${{ vars.SERVER_SFTP_PORT }}
+          SERVER_SFTP_PATH: ${{ vars.SERVER_SFTP_PATH }}
+          SERVER_SFTP_USERNAME: ${{ secrets.SERVER_SFTP_USERNAME }}
+          SERVER_SFTP_PASSWORD: ${{ secrets.SERVER_SFTP_PASSWORD }}
+          SERVER_SFTP_PRIVATE_KEY: ${{ secrets.SERVER_SFTP_PRIVATE_KEY }}
+          SERVER_SFTP_KNOWN_HOSTS: ${{ secrets.SERVER_SFTP_KNOWN_HOSTS }}
+        run: python .schematic-tools/scripts/server_deploy.py mark-failed || true
       - name: Report live deployment
         run: |
           if [ '${{ steps.preflight.outcome }}' = 'failure' ]; then
