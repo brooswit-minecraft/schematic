@@ -13,7 +13,12 @@ name: Reusable Accepted-Merge Release
 # (inputs, outputs, the six states, and the retry/overlap guarantees).
 #
 # Decision logic lives in scripts/release_state.py (unit tested in
-# tests/test_release_state.py) so it is testable without a runner.
+# tests/test_release_state.py) so it is testable without a runner. A
+# calling repo's own checkout (at `sha`) is NOT assumed to contain this
+# script — every job below checks out this helper separately from
+# brooswit-minecraft/schematic itself, pinned to `schematic-ref`, into
+# `.schematic-mechanism/`, so a consumer repo needs nothing copied in to
+# use this workflow.
 
 on:
   workflow_call:
@@ -29,7 +34,9 @@ on:
         description: >-
           Pack version to release, e.g. 1.2.3 or 1.2.3-beta.1 (a leading
           "v" is accepted and stripped). Validated as semver-like; an
-          invalid value fails the run before anything is built.
+          invalid value fails the run before anything is built. Canonicalized
+          (leading "v" stripped) before it is used anywhere, including the
+          concurrency lock, so `1.2.3` and `v1.2.3` are the same release.
         required: true
         type: string
       authorized:
@@ -71,6 +78,15 @@ on:
         required: false
         type: string
         default: 'v0.9.1'
+      schematic-ref:
+        description: >-
+          Pinned brooswit-minecraft/schematic tag/sha this workflow itself
+          checks out its own mechanism helper (scripts/release_state.py)
+          from. Pin this the same way a consumer pins the workflow's own
+          `uses: ...@<ref>` — the two should normally match.
+        required: false
+        type: string
+        default: 'v1'
     outputs:
       state:
         description: 'One of: build-only, held, skipped, publishing, published, failed.'
@@ -94,54 +110,72 @@ on:
         description: 'Modrinth version id, when a Modrinth version exists for this run (reused or created).'
         value: ${{ jobs.release.outputs.modrinth-version-id }}
 
-concurrency:
-  # Serializes per repo+version so a retry or an overlapping event for the
-  # same release can never race another run of the same release (DoD #2).
-  # cancel-in-progress is deliberately false: the second run must reconcile
-  # against what the first one did, not erase its progress.
-  group: accepted-merge-release-${{ github.repository }}-${{ inputs.version }}
-  cancel-in-progress: false
-
 jobs:
+  # Validates inputs and resolves the canonical (no leading "v") version
+  # BEFORE the release job's concurrency group is evaluated. A job's
+  # `concurrency:` key can reference `needs.*.outputs`, which is what lets
+  # the lock below key on the canonical version rather than the raw input —
+  # `1.2.3` and `v1.2.3` must serialize against each other, not get
+  # independent locks for what is the same release.
+  normalize:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.validate.outputs.sha }}
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - name: Check out schematic mechanism helper
+        uses: actions/checkout@v4
+        with:
+          repository: brooswit-minecraft/schematic
+          ref: ${{ inputs.schematic-ref }}
+          path: .schematic-mechanism
+
+      - name: Validate sha and version
+        id: validate
+        env:
+          SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          out="$(python3 .schematic-mechanism/scripts/release_state.py validate --sha "$SHA" --version "$VERSION")" || {
+            echo "::error::$(echo "$out" | jq -r .error)"
+            exit 1
+          }
+          echo "sha=$(echo "$out" | jq -r .sha)" >> "$GITHUB_OUTPUT"
+          echo "version=$(echo "$out" | jq -r .version)" >> "$GITHUB_OUTPUT"
+
   release:
     name: Reconcile accepted-merge release
+    needs: normalize
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    concurrency:
+      # Serializes per repo+CANONICAL version so a retry or an overlapping
+      # event for the same release can never race another run of the same
+      # release (DoD #2), and so `1.2.3`/`v1.2.3` callers share one lock.
+      # cancel-in-progress is deliberately false: the second run must
+      # reconcile against what the first one did, not erase its progress.
+      group: accepted-merge-release-${{ github.repository }}-${{ needs.normalize.outputs.version }}
+      cancel-in-progress: false
     outputs:
       state: ${{ steps.finalize.outputs.state || steps.shortcircuit.outputs.state || 'failed' }}
-      sha: ${{ steps.validate.outputs.sha }}
-      version: ${{ steps.validate.outputs.version }}
+      sha: ${{ needs.normalize.outputs.sha }}
+      version: ${{ needs.normalize.outputs.version }}
       artifact-name: ${{ steps.pack.outputs.name }}
       release-id: ${{ steps.finalize.outputs.release-id || steps.shortcircuit.outputs.release-id }}
       release-url: ${{ steps.finalize.outputs.release-url || steps.shortcircuit.outputs.release-url }}
       modrinth-version-id: ${{ steps.finalize.outputs.modrinth-version-id || steps.shortcircuit.outputs.modrinth-version-id }}
     steps:
-      # Validated before checkout: a bad sha/version must fail actionably
-      # without spending a checkout or a build on it.
-      - name: Validate inputs
-        id: pre-validate
-        env:
-          SHA: ${{ inputs.sha }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          case "$SHA" in
-            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
-            *)
-              echo "::error::sha must be an exact 40-character lowercase hex commit SHA, got '$SHA'"
-              exit 1
-              ;;
-          esac
-          echo "ok=true" >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.sha }}
+          ref: ${{ needs.normalize.outputs.sha }}
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Confirm checkout resolved to the exact requested SHA
         env:
-          SHA: ${{ inputs.sha }}
+          SHA: ${{ needs.normalize.outputs.sha }}
         run: |
           resolved="$(git rev-parse HEAD)"
           if [ "$resolved" != "$SHA" ]; then
@@ -149,18 +183,12 @@ jobs:
             exit 1
           fi
 
-      - name: Validate version, decide inputs
-        id: validate
-        env:
-          SHA: ${{ inputs.sha }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          out="$(python3 scripts/release_state.py validate --sha "$SHA" --version "$VERSION")" || {
-            echo "::error::$(echo "$out" | jq -r .error)"
-            exit 1
-          }
-          echo "sha=$(echo "$out" | jq -r .sha)" >> "$GITHUB_OUTPUT"
-          echo "version=$(echo "$out" | jq -r .version)" >> "$GITHUB_OUTPUT"
+      - name: Check out schematic mechanism helper
+        uses: actions/checkout@v4
+        with:
+          repository: brooswit-minecraft/schematic
+          ref: ${{ inputs.schematic-ref }}
+          path: .schematic-mechanism
 
       - uses: actions/setup-go@v5
         with:
@@ -171,7 +199,7 @@ jobs:
 
       - name: Set pack version
         env:
-          VERSION: ${{ steps.validate.outputs.version }}
+          VERSION: ${{ needs.normalize.outputs.version }}
         run: |
           escaped=$(printf '%s' "$VERSION" | sed 's/[&\|]/\\&/g')
           sed -i "s|^version = \".*\"|version = \"${escaped}\"|" pack.toml
@@ -182,7 +210,7 @@ jobs:
       - name: Resolve artifact name
         id: pack
         env:
-          VERSION: ${{ steps.validate.outputs.version }}
+          VERSION: ${{ needs.normalize.outputs.version }}
         run: echo "name=$(sed -n 's/^name = "\(.*\)"/\1/p' pack.toml)-${VERSION}-mrpack" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
@@ -244,21 +272,37 @@ jobs:
 
       # Read-only reconcile probes: gather facts about what already exists
       # before deciding anything or mutating anything.
-      - name: Look up existing GitHub Release
+      #
+      # The tag's own PEELED commit (not a GitHub Release's cached
+      # target_commitish) is the authority for "does v<version> already
+      # point somewhere" — a release object's metadata can exist
+      # independently of (and, in principle, disagree with) the tag it
+      # names, and a tag can exist with no Release object at all (e.g. one
+      # pushed by hand). `^{commit}` peels an annotated tag to the commit it
+      # points at; a lightweight tag resolves to the commit directly either
+      # way.
+      - name: Look up existing release tag
+        id: existing_tag
+        env:
+          VERSION: ${{ needs.normalize.outputs.version }}
+        run: |
+          if git rev-parse --verify --quiet "refs/tags/v${VERSION}^{commit}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "sha=$(git rev-parse "refs/tags/v${VERSION}^{commit}")" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Look up existing GitHub Release object
         id: existing_release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.validate.outputs.version }}
+          VERSION: ${{ needs.normalize.outputs.version }}
         run: |
-          if out="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json databaseId,url,targetCommitish 2>/dev/null)"; then
+          if out="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json databaseId,url 2>/dev/null)"; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "id=$(echo "$out" | jq -r .databaseId)" >> "$GITHUB_OUTPUT"
             echo "url=$(echo "$out" | jq -r .url)" >> "$GITHUB_OUTPUT"
-            target="$(echo "$out" | jq -r .targetCommitish)"
-            # target_commitish may be a branch name instead of a SHA on an
-            # older/human-made release; resolve it the same way git would.
-            resolved_target="$(git rev-parse "$target" 2>/dev/null || echo "$target")"
-            echo "target_sha=$resolved_target" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
@@ -272,7 +316,7 @@ jobs:
         env:
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
           PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
-          VERSION: ${{ steps.validate.outputs.version }}
+          VERSION: ${{ needs.normalize.outputs.version }}
           RINTH_REF: ${{ inputs.rinth-ref }}
         run: |
           set +e
@@ -294,15 +338,16 @@ jobs:
       - name: Decide publication state
         id: decide
         env:
-          SHA: ${{ steps.validate.outputs.sha }}
+          SHA: ${{ needs.normalize.outputs.sha }}
           AUTHORIZED: ${{ inputs.authorized }}
           HOLD: ${{ inputs.hold }}
           MODRINTH_REQUIRED: ${{ inputs.modrinth-required }}
           MODRINTH_CONFIGURED: ${{ steps.modrinth_check.outputs.configured }}
+          TAG_EXISTS: ${{ steps.existing_tag.outputs.exists }}
+          TAG_SHA: ${{ steps.existing_tag.outputs.sha }}
           RELEASE_EXISTS: ${{ steps.existing_release.outputs.exists }}
           RELEASE_ID: ${{ steps.existing_release.outputs.id }}
           RELEASE_URL: ${{ steps.existing_release.outputs.url }}
-          RELEASE_TARGET_SHA: ${{ steps.existing_release.outputs.target_sha }}
           MODRINTH_EXISTS: ${{ steps.existing_modrinth.outputs.exists }}
           MODRINTH_ID: ${{ steps.existing_modrinth.outputs.id }}
         run: |
@@ -318,12 +363,13 @@ jobs:
               "hold": as_bool(os.environ["HOLD"]),
               "modrinth_required": as_bool(os.environ["MODRINTH_REQUIRED"]),
               "modrinth_configured": as_bool(os.environ["MODRINTH_CONFIGURED"]),
+              "existing_tag": (
+                  {"sha": os.environ["TAG_SHA"]}
+                  if as_bool(os.environ["TAG_EXISTS"])
+                  else None
+              ),
               "existing_release": (
-                  {
-                      "id": os.environ["RELEASE_ID"],
-                      "url": os.environ["RELEASE_URL"],
-                      "target_sha": os.environ["RELEASE_TARGET_SHA"],
-                  }
+                  {"id": os.environ["RELEASE_ID"], "url": os.environ["RELEASE_URL"]}
                   if as_bool(os.environ["RELEASE_EXISTS"])
                   else None
               ),
@@ -336,7 +382,7 @@ jobs:
           print(json.dumps(facts))
           PYEOF
           set +e
-          out="$(python3 scripts/release_state.py decide --facts "$RUNNER_TEMP/facts.json")"
+          out="$(python3 .schematic-mechanism/scripts/release_state.py decide --facts "$RUNNER_TEMP/facts.json")"
           set -e
           echo "$out" > "$RUNNER_TEMP/decision.json"
           state="$(echo "$out" | jq -r .state)"
@@ -378,14 +424,19 @@ jobs:
           fi
           echo "file=$file" >> "$GITHUB_OUTPUT"
 
+      # softprops/action-gh-release: when the tag already exists, GitHub
+      # ignores target_commitish and attaches the release to the commit the
+      # tag already points at — which `existing_tag`'s match against `sha`
+      # above already guarantees is the requested commit. target_commitish
+      # here only matters on first creation of the tag itself.
       - name: Create GitHub Release
         id: create_release
         if: steps.decide.outputs.state == 'publishing' && steps.decide.outputs.release_action == 'create'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.validate.outputs.version }}
+          tag_name: v${{ needs.normalize.outputs.version }}
           name: ${{ steps.pack.outputs.name }}
-          target_commitish: ${{ steps.validate.outputs.sha }}
+          target_commitish: ${{ needs.normalize.outputs.sha }}
           generate_release_notes: ${{ inputs['notes-file'] == '' }}
           body_path: ${{ inputs['notes-file'] != '' && steps.changelog.outputs.file || '' }}
           files: build/*.mrpack
@@ -399,7 +450,7 @@ jobs:
         if: steps.decide.outputs.state == 'publishing' && steps.decide.outputs.release_action == 'create'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.validate.outputs.version }}
+          VERSION: ${{ needs.normalize.outputs.version }}
         run: |
           out="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json databaseId,url)"
           echo "id=$(echo "$out" | jq -r .databaseId)" >> "$GITHUB_OUTPUT"
@@ -423,11 +474,11 @@ jobs:
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
           PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
           MRPACK_FILE: ${{ steps.mrpack.outputs.file }}
-          VERSION: ${{ steps.validate.outputs.version }}
+          VERSION: ${{ needs.normalize.outputs.version }}
           CHANGELOG_FILE: ${{ steps.changelog.outputs.file }}
           MINECRAFT: ${{ steps.targets.outputs.minecraft }}
           LOADERS: ${{ steps.targets.outputs.loaders }}
-          CHANNEL: ${{ contains(steps.validate.outputs.version, '-') && 'beta' || 'release' }}
+          CHANNEL: ${{ contains(needs.normalize.outputs.version, '-') && 'beta' || 'release' }}
           RINTH_REF: ${{ inputs.rinth-ref }}
         run: |
           loader_flags=()

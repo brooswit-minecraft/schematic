@@ -4,10 +4,15 @@ state machine (MINECRAFT-371 implementing MINECRAFT-44).
 
 Extracted from .github/workflows/reusable-accepted-merge-release.yml so the
 decision logic is unit-testable without a GitHub Actions runner. The
-workflow shells out to `gh release view` and `rinth versions latest` to
-gather facts (existing release / existing Modrinth version, or None for
-"doesn't exist"), then calls `decide()` with those facts to get back one of
-six states: build-only, held, skipped, publishing, published, failed.
+workflow resolves the release tag's own PEELED commit sha with `git
+rev-parse refs/tags/vVERSION^{commit}` (not a GitHub Release's cached
+`target_commitish`, which can exist independently of — or in principle
+disagree with — the tag itself), looks up any GitHub Release object with
+`gh release view`, and checks Modrinth with `rinth versions latest`, to
+gather facts (existing tag / existing release / existing Modrinth version,
+or None for "doesn't exist"), then calls `decide()` with those facts to get
+back one of six states: build-only, held, skipped, publishing, published,
+failed.
 
 `publishing` is never returned by `decide()` itself — it is a transient
 state the *workflow* writes to its job output after `decide()` says to
@@ -94,10 +99,20 @@ def decide(
     hold: bool,
     modrinth_required: bool,
     modrinth_configured: bool,
+    existing_tag: Optional[dict],
     existing_release: Optional[dict],
     existing_modrinth_version: Optional[dict],
 ) -> Decision:
-    """`existing_release`: {"id": ..., "url": ..., "target_sha": ...} or None.
+    """`existing_tag`: {"sha": ...} or None — the vVERSION git tag's own
+    PEELED commit sha (annotated tags resolved to the commit they point at),
+    resolved independently of any GitHub Release object. This, not a
+    release's cached `target_commitish` metadata, is the source of truth
+    for "does this tag already point somewhere", since a tag can exist
+    without a release (or, in principle, disagree with stale release
+    metadata).
+    `existing_release`: {"id": ..., "url": ...} or None — whether a GitHub
+    Release object exists for this tag. Only consulted for reuse-vs-create;
+    never for the sha-mismatch check.
     `existing_modrinth_version`: {"id": ...} or None.
     Never raises — a reconcile failure is reported as state=failed.
     """
@@ -107,18 +122,19 @@ def decide(
     if hold:
         return Decision(state="held")
 
+    if existing_tag is not None and existing_tag.get("sha") != sha:
+        return Decision(
+            state="failed",
+            error=(
+                f"the release tag already exists at {existing_tag.get('sha')!r}, "
+                f"not the requested sha {sha!r} — refusing to repoint an "
+                "existing tag/release"
+            ),
+        )
+
     release_action = "none"
     release_id = release_url = None
     if existing_release is not None:
-        if existing_release.get("target_sha") != sha:
-            return Decision(
-                state="failed",
-                error=(
-                    "a GitHub Release for this tag already exists but targets "
-                    f"{existing_release.get('target_sha')!r}, not the requested "
-                    f"sha {sha!r} — refusing to repoint an existing release"
-                ),
-            )
         release_action = "reuse"
         release_id = existing_release.get("id")
         release_url = existing_release.get("url")
@@ -180,6 +196,7 @@ def _cmd_decide(args: argparse.Namespace) -> dict:
         hold=bool(facts["hold"]),
         modrinth_required=bool(facts["modrinth_required"]),
         modrinth_configured=bool(facts["modrinth_configured"]),
+        existing_tag=facts.get("existing_tag"),
         existing_release=facts.get("existing_release"),
         existing_modrinth_version=facts.get("existing_modrinth_version"),
     )

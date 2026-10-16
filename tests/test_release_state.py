@@ -74,6 +74,7 @@ def decide(**overrides):
         hold=False,
         modrinth_required=True,
         modrinth_configured=True,
+        existing_tag=None,
         existing_release=None,
         existing_modrinth_version=None,
     )
@@ -115,17 +116,42 @@ class DecideStates(unittest.TestCase):
         self.assertEqual(d.release_action, "create")
         self.assertEqual(d.modrinth_action, "create")
 
-    def test_sha_mismatch_on_existing_release_fails_loudly(self):
-        d = decide(existing_release={"id": "1", "url": "u", "target_sha": SHA_B})
+    def test_sha_mismatch_on_existing_tag_fails_loudly(self):
+        # Metadata/actual-tag disagreement: the tag itself is the source of
+        # truth, regardless of whether a Release object exists or what it
+        # claims.
+        d = decide(existing_tag={"sha": SHA_B}, existing_release=None)
         self.assertEqual(d.state, "failed")
         self.assertIn(SHA_B, d.error)
         self.assertIn(SHA_A, d.error)
+        self.assertEqual(d.release_action, "none")
+
+    def test_sha_mismatch_fails_even_with_a_matching_release_object(self):
+        # A Release object's own cached metadata must never substitute for
+        # the tag's actual peeled commit when they disagree.
+        d = decide(
+            existing_tag={"sha": SHA_B},
+            existing_release={"id": "1", "url": "u"},
+        )
+        self.assertEqual(d.state, "failed")
+
+    def test_existing_tag_without_release_object_still_creates_release(self):
+        # A tag was pushed (e.g. manually) but no GitHub Release exists yet
+        # for it. The tag matches the requested sha, so this is safe to
+        # proceed: create the Release object (GitHub will attach it to the
+        # existing tag, ignoring target_commitish, since the tag already
+        # exists at the right commit).
+        d = decide(existing_tag={"sha": SHA_A}, existing_release=None)
+        self.assertEqual(d.state, "publishing")
+        self.assertEqual(d.release_action, "create")
 
     def test_full_replay_of_completed_publish_is_skipped(self):
-        # Retry/overlap (DoD #2): release AND modrinth version already exist
-        # for this exact sha/version — no mutation, existing identity returned.
+        # Retry/overlap (DoD #2): tag, release AND modrinth version already
+        # exist for this exact sha/version — no mutation, existing identity
+        # returned.
         d = decide(
-            existing_release={"id": "123", "url": "https://x/123", "target_sha": SHA_A},
+            existing_tag={"sha": SHA_A},
+            existing_release={"id": "123", "url": "https://x/123"},
             existing_modrinth_version={"id": "mv1"},
         )
         self.assertEqual(d.state, "skipped")
@@ -140,7 +166,8 @@ class DecideStates(unittest.TestCase):
         # and still attempts the Modrinth publish, rather than recreating
         # the release or silently skipping Modrinth.
         d = decide(
-            existing_release={"id": "123", "url": "https://x/123", "target_sha": SHA_A},
+            existing_tag={"sha": SHA_A},
+            existing_release={"id": "123", "url": "https://x/123"},
             existing_modrinth_version=None,
         )
         self.assertEqual(d.state, "publishing")
@@ -148,14 +175,25 @@ class DecideStates(unittest.TestCase):
         self.assertEqual(d.modrinth_action, "create")
 
     def test_overlap_two_calls_same_sha_second_is_skipped_not_duplicated(self):
-        first = decide(existing_release=None, existing_modrinth_version=None)
+        first = decide(existing_tag=None, existing_release=None, existing_modrinth_version=None)
         self.assertEqual(first.release_action, "create")
         # First call's effects observed by the second (overlapping/retried) call:
         second = decide(
-            existing_release={"id": "1", "url": "u", "target_sha": SHA_A},
+            existing_tag={"sha": SHA_A},
+            existing_release={"id": "1", "url": "u"},
             existing_modrinth_version={"id": "mv"},
         )
         self.assertEqual(second.state, "skipped")
+
+    def test_overlap_two_calls_different_sha_second_fails_without_mutation(self):
+        # Overlapping calls for the SAME version but DIFFERENT shas: the
+        # first to land wins the tag; the second must fail rather than
+        # repoint it.
+        first = decide(sha=SHA_A, existing_tag=None)
+        self.assertEqual(first.release_action, "create")
+        second = decide(sha=SHA_B, existing_tag={"sha": SHA_A})
+        self.assertEqual(second.state, "failed")
+        self.assertEqual(second.release_action, "none")
 
 
 class DecisionJson(unittest.TestCase):
@@ -193,6 +231,7 @@ class CliValidate(unittest.TestCase):
             "hold": False,
             "modrinth_required": True,
             "modrinth_configured": True,
+            "existing_tag": None,
             "existing_release": None,
             "existing_modrinth_version": None,
         }
@@ -212,6 +251,7 @@ class CliValidate(unittest.TestCase):
             "hold": False,
             "modrinth_required": True,
             "modrinth_configured": False,
+            "existing_tag": None,
             "existing_release": None,
             "existing_modrinth_version": None,
         }

@@ -15,6 +15,12 @@ This is a separate, additive contract from the existing
 no `authorized`/`hold`/idempotent-reconcile concepts). Nothing here changes
 that workflow's behavior.
 
+A calling repo's own checkout (at `sha`) is **not** assumed to contain
+`scripts/release_state.py` — this workflow checks that helper out itself
+from `brooswit-minecraft/schematic` (pinned to `schematic-ref`) into
+`.schematic-mechanism/` in every job that needs it, so a consumer repo
+needs nothing copied in to use this workflow.
+
 ## Calling it
 
 ```yaml
@@ -36,12 +42,13 @@ jobs:
 | Input | Required | Type | Description |
 | --- | --- | --- | --- |
 | `sha` | yes | string | Immutable source commit SHA — exactly 40 lowercase hex characters. Always checked out explicitly; never the caller's own triggering ref. |
-| `version` | yes | string | Pack version to release, e.g. `1.2.3` or `1.2.3-beta.1`. A leading `v` is accepted and stripped. Validated as semver-like. |
+| `version` | yes | string | Pack version to release, e.g. `1.2.3` or `1.2.3-beta.1`. A leading `v` is accepted and stripped. Validated as semver-like, and **canonicalized before anything else uses it** — including the concurrency lock — so `1.2.3` and `v1.2.3` are the same release, not two independently-locked ones. |
 | `authorized` | yes | boolean | Whether the caller's own policy has accepted this merge for release. |
 | `hold` | no (default `false`) | boolean | Explicit release hold, checked only when `authorized` is `true`. |
 | `modrinth-required` | no (default `true`) | boolean | When `true` and Modrinth isn't configured, the run **fails** rather than silently publishing GitHub-only. |
 | `notes-file` | no (default `''`) | string | Repo-relative path, read at the checked-out `sha`, used as both the GitHub release body and the Modrinth changelog. |
 | `rinth-ref` | no (default `v0.9.1`) | string | Pinned `brooswit-minecraft/rinth` tag invoked via `bunx`. |
+| `schematic-ref` | no (default `v1`) | string | Pinned `brooswit-minecraft/schematic` tag/sha this workflow checks its own mechanism helper out from. Pin this the same way you pin the workflow's own `uses: ...@<ref>` — the two should normally match. |
 
 An invalid `sha` or `version` fails the run before any checkout/build step
 with an actionable `::error::`.
@@ -86,9 +93,11 @@ tested in `tests/test_release_state.py` independent of any runner.
    exists (created or reused) **and** Modrinth publication is resolved
    (created, reused, or not required in the first place).
 6. **`failed`** — any validation or reconciliation failure: invalid
-   `sha`/`version`, a release tag that already points at a *different* SHA
-   than requested (refused rather than repointed), or — when
-   `modrinth-required` is `true` — missing `MODRINTH_TOKEN`/
+   `sha`/`version`, an existing `v<version>` tag whose own peeled commit is a
+   *different* SHA than requested (refused rather than repointed — checked
+   regardless of whether a GitHub Release object exists for that tag, and
+   regardless of what any such release's own cached metadata claims), or —
+   when `modrinth-required` is `true` — missing `MODRINTH_TOKEN`/
    `MODRINTH_PROJECT_ID`. The run exits non-zero with an actionable
    `::error::`.
 
@@ -99,14 +108,23 @@ by resuming a partially-done one).
 
 ## Idempotence and concurrency (DoD #2)
 
-- `concurrency: group: accepted-merge-release-<repo>-<version>`,
-  `cancel-in-progress: false` serializes overlapping/retried calls for the
-  same repo+version so they reconcile against each other in order instead
-  of racing.
-- The GitHub Release reconcile (`gh release view v<version>`) reuses an
-  existing release that targets the requested `sha`, and **refuses** (fails
-  loudly, `state=failed`) a release whose tag already targets a *different*
-  SHA — it never repoints an existing release.
+- A dedicated `normalize` job validates inputs and canonicalizes `version`
+  (strips a leading `v`) *before* the `release` job's `concurrency:` key is
+  evaluated (job-level `concurrency:` can reference `needs.*.outputs`). The
+  lock is `accepted-merge-release-<repo>-<canonical-version>`,
+  `cancel-in-progress: false` — so `1.2.3` and `v1.2.3` share one lock
+  instead of racing each other under two different group names, and an
+  overlapping/retried call for the same release reconciles against the
+  prior run in order instead of racing it.
+- The release-tag reconcile resolves `v<version>`'s own **peeled git
+  commit** (`git rev-parse refs/tags/v<version>^{commit}`) — not a GitHub
+  Release's cached `target_commitish` — and compares that to the requested
+  `sha`. This is checked whether or not a Release object exists for the
+  tag (a tag can exist without one), and a mismatch **fails without any
+  mutation**, regardless of what a co-existing release's own metadata might
+  claim. The GitHub Release object itself (`gh release view v<version>`) is
+  looked up separately, purely to decide reuse-vs-create once the tag check
+  has already passed.
 - The Modrinth reconcile (`rinth versions latest <project> --version-number
   <version> --json`) reuses an existing matching version instead of
   attempting to recreate it; `rinth publish` itself also refuses a
