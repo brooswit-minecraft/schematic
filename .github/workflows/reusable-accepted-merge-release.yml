@@ -1,0 +1,467 @@
+name: Reusable Accepted-Merge Release
+
+# MINECRAFT-371 implementing MINECRAFT-44: a schematic-owned, idempotent
+# release-orchestration contract for consumers (e.g. brooswit-minecraft/sickos)
+# whose own release-policy workflow has already decided a merge is
+# accepted-for-release and computed the version/authorization/hold inputs.
+# This workflow owns only the shared MECHANISM — checkout of an immutable
+# SHA, GitHub Release reconcile, the RINTH/Modrinth publication boundary,
+# and the machine-readable state contract. Consumer repos keep their own
+# eligibility/version/hold POLICY and pass the results in as inputs.
+#
+# See docs/accepted-merge-release-contract.md for the full contract
+# (inputs, outputs, the six states, and the retry/overlap guarantees).
+#
+# Decision logic lives in scripts/release_state.py (unit tested in
+# tests/test_release_state.py) so it is testable without a runner.
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: >-
+          Immutable source commit SHA to build and (if authorized) release —
+          exactly 40 lowercase hex characters. This workflow always checks
+          out this exact SHA, never the caller's own triggering ref.
+        required: true
+        type: string
+      version:
+        description: >-
+          Pack version to release, e.g. 1.2.3 or 1.2.3-beta.1 (a leading
+          "v" is accepted and stripped). Validated as semver-like; an
+          invalid value fails the run before anything is built.
+        required: true
+        type: string
+      authorized:
+        description: >-
+          Whether the caller's own policy has accepted this merge for
+          release. false produces state=build-only: the pack is built and
+          uploaded as a workflow artifact, nothing is released or published.
+        required: true
+        type: boolean
+      hold:
+        description: >-
+          Explicit release hold. When true (and authorized is true),
+          produces state=held — same build-only behaviour as authorized:
+          false, but distinguishes "paused despite being eligible" from
+          "not eligible" for anyone reading the state output.
+        required: false
+        type: boolean
+        default: false
+      modrinth-required:
+        description: >-
+          When true (the default) and MODRINTH_TOKEN/MODRINTH_PROJECT_ID
+          are not configured, the run FAILS actionably rather than silently
+          publishing only the GitHub Release. Set false for a consumer that
+          intentionally releases to GitHub only.
+        required: false
+        type: boolean
+        default: true
+      notes-file:
+        description: >-
+          Repo-relative path to a file, read at the checked-out sha, whose
+          contents become the GitHub release body and the Modrinth
+          changelog. Leave empty for an auto-generated GitHub release body
+          and an empty Modrinth changelog.
+        required: false
+        type: string
+        default: ''
+      rinth-ref:
+        description: 'Pinned brooswit-minecraft/rinth tag to invoke via bunx.'
+        required: false
+        type: string
+        default: 'v0.9.1'
+    outputs:
+      state:
+        description: 'One of: build-only, held, skipped, publishing, published, failed.'
+        value: ${{ jobs.release.outputs.state }}
+      sha:
+        description: 'The exact source SHA this run built from (echoes the input).'
+        value: ${{ jobs.release.outputs.sha }}
+      version:
+        description: 'The validated, normalized version (no leading v).'
+        value: ${{ jobs.release.outputs.version }}
+      artifact-name:
+        description: 'Name of the uploaded .mrpack workflow artifact.'
+        value: ${{ jobs.release.outputs.artifact-name }}
+      release-id:
+        description: 'GitHub Release id, when a release exists for this run (reused or created).'
+        value: ${{ jobs.release.outputs.release-id }}
+      release-url:
+        description: 'GitHub Release URL, when a release exists for this run.'
+        value: ${{ jobs.release.outputs.release-url }}
+      modrinth-version-id:
+        description: 'Modrinth version id, when a Modrinth version exists for this run (reused or created).'
+        value: ${{ jobs.release.outputs.modrinth-version-id }}
+
+concurrency:
+  # Serializes per repo+version so a retry or an overlapping event for the
+  # same release can never race another run of the same release (DoD #2).
+  # cancel-in-progress is deliberately false: the second run must reconcile
+  # against what the first one did, not erase its progress.
+  group: accepted-merge-release-${{ github.repository }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Reconcile accepted-merge release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      state: ${{ steps.finalize.outputs.state || steps.shortcircuit.outputs.state || 'failed' }}
+      sha: ${{ steps.validate.outputs.sha }}
+      version: ${{ steps.validate.outputs.version }}
+      artifact-name: ${{ steps.pack.outputs.name }}
+      release-id: ${{ steps.finalize.outputs.release-id || steps.shortcircuit.outputs.release-id }}
+      release-url: ${{ steps.finalize.outputs.release-url || steps.shortcircuit.outputs.release-url }}
+      modrinth-version-id: ${{ steps.finalize.outputs.modrinth-version-id || steps.shortcircuit.outputs.modrinth-version-id }}
+    steps:
+      # Validated before checkout: a bad sha/version must fail actionably
+      # without spending a checkout or a build on it.
+      - name: Validate inputs
+        id: pre-validate
+        env:
+          SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          case "$SHA" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
+            *)
+              echo "::error::sha must be an exact 40-character lowercase hex commit SHA, got '$SHA'"
+              exit 1
+              ;;
+          esac
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+
+      - name: Confirm checkout resolved to the exact requested SHA
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          resolved="$(git rev-parse HEAD)"
+          if [ "$resolved" != "$SHA" ]; then
+            echo "::error::checked out HEAD ($resolved) does not match the requested sha ($SHA) — refusing to proceed on an ambiguous ref"
+            exit 1
+          fi
+
+      - name: Validate version, decide inputs
+        id: validate
+        env:
+          SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          out="$(python3 scripts/release_state.py validate --sha "$SHA" --version "$VERSION")" || {
+            echo "::error::$(echo "$out" | jq -r .error)"
+            exit 1
+          }
+          echo "sha=$(echo "$out" | jq -r .sha)" >> "$GITHUB_OUTPUT"
+          echo "version=$(echo "$out" | jq -r .version)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Install pinned packwiz
+        run: make tools
+
+      - name: Set pack version
+        env:
+          VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          escaped=$(printf '%s' "$VERSION" | sed 's/[&\|]/\\&/g')
+          sed -i "s|^version = \".*\"|version = \"${escaped}\"|" pack.toml
+
+      - name: Build .mrpack
+        run: make build
+
+      - name: Resolve artifact name
+        id: pack
+        env:
+          VERSION: ${{ steps.validate.outputs.version }}
+        run: echo "name=$(sed -n 's/^name = "\(.*\)"/\1/p' pack.toml)-${VERSION}-mrpack" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: build/*.mrpack
+          if-no-files-found: error
+
+      - name: Resolve .mrpack path
+        id: mrpack
+        run: |
+          shopt -s nullglob
+          mrpacks=(build/*.mrpack)
+          if [ "${#mrpacks[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one .mrpack in build/, found ${#mrpacks[@]}"
+            exit 1
+          fi
+          echo "file=${mrpacks[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate notes-file
+        if: inputs['notes-file'] != ''
+        env:
+          NOTES_FILE: ${{ inputs['notes-file'] }}
+        run: |
+          case "$NOTES_FILE" in
+            /*)
+              echo "::error::notes-file must be a repo-relative path, got an absolute path: '$NOTES_FILE'"
+              exit 1
+              ;;
+          esac
+          workspace="$(realpath -e -- "$GITHUB_WORKSPACE")"
+          if ! resolved="$(realpath -e -- "$NOTES_FILE" 2>/dev/null)"; then
+            echo "::error::notes-file '$NOTES_FILE' does not exist"
+            exit 1
+          fi
+          case "$resolved" in
+            "$workspace"/*|"$workspace") : ;;
+            *)
+              echo "::error::notes-file '$NOTES_FILE' resolves outside the checkout"
+              exit 1
+              ;;
+          esac
+          [ -d "$resolved" ] && { echo "::error::notes-file '$NOTES_FILE' is a directory, not a file"; exit 1; }
+          [ -s "$resolved" ] || { echo "::error::notes-file '$NOTES_FILE' is empty"; exit 1; }
+
+      # Secrets can't be read directly in `if:`, so map into env and test
+      # only for emptiness.
+      - name: Check Modrinth configuration
+        id: modrinth_check
+        env:
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          MODRINTH_PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
+        run: |
+          if [ -n "$MODRINTH_TOKEN" ] && [ -n "$MODRINTH_PROJECT_ID" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Read-only reconcile probes: gather facts about what already exists
+      # before deciding anything or mutating anything.
+      - name: Look up existing GitHub Release
+        id: existing_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          if out="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json databaseId,url,targetCommitish 2>/dev/null)"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "id=$(echo "$out" | jq -r .databaseId)" >> "$GITHUB_OUTPUT"
+            echo "url=$(echo "$out" | jq -r .url)" >> "$GITHUB_OUTPUT"
+            target="$(echo "$out" | jq -r .targetCommitish)"
+            # target_commitish may be a branch name instead of a SHA on an
+            # older/human-made release; resolve it the same way git would.
+            resolved_target="$(git rev-parse "$target" 2>/dev/null || echo "$target")"
+            echo "target_sha=$resolved_target" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.modrinth_check.outputs.configured == 'true'
+
+      - name: Look up existing Modrinth version
+        id: existing_modrinth
+        if: steps.modrinth_check.outputs.configured == 'true'
+        env:
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          RINTH_REF: ${{ inputs.rinth-ref }}
+        run: |
+          set +e
+          out="$(bunx --bun "github:brooswit-minecraft/rinth#${RINTH_REF}" versions latest "$PROJECT_ID" --version-number "$VERSION" --json 2>&1)"
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "id=$(echo "$out" | jq -r .id)" >> "$GITHUB_OUTPUT"
+          elif [ "$code" -eq 7 ]; then
+            # NoVersionMatch (rinth ExitCode.NoVersionMatch) — no existing
+            # version for this version-number, not an error.
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::rinth versions latest failed unexpectedly (exit $code): $out"
+            exit 1
+          fi
+
+      - name: Decide publication state
+        id: decide
+        env:
+          SHA: ${{ steps.validate.outputs.sha }}
+          AUTHORIZED: ${{ inputs.authorized }}
+          HOLD: ${{ inputs.hold }}
+          MODRINTH_REQUIRED: ${{ inputs.modrinth-required }}
+          MODRINTH_CONFIGURED: ${{ steps.modrinth_check.outputs.configured }}
+          RELEASE_EXISTS: ${{ steps.existing_release.outputs.exists }}
+          RELEASE_ID: ${{ steps.existing_release.outputs.id }}
+          RELEASE_URL: ${{ steps.existing_release.outputs.url }}
+          RELEASE_TARGET_SHA: ${{ steps.existing_release.outputs.target_sha }}
+          MODRINTH_EXISTS: ${{ steps.existing_modrinth.outputs.exists }}
+          MODRINTH_ID: ${{ steps.existing_modrinth.outputs.id }}
+        run: |
+          python3 - <<'PYEOF' > "$RUNNER_TEMP/facts.json"
+          import json, os
+
+          def as_bool(v):
+              return str(v).strip().lower() == "true"
+
+          facts = {
+              "sha": os.environ["SHA"],
+              "authorized": as_bool(os.environ["AUTHORIZED"]),
+              "hold": as_bool(os.environ["HOLD"]),
+              "modrinth_required": as_bool(os.environ["MODRINTH_REQUIRED"]),
+              "modrinth_configured": as_bool(os.environ["MODRINTH_CONFIGURED"]),
+              "existing_release": (
+                  {
+                      "id": os.environ["RELEASE_ID"],
+                      "url": os.environ["RELEASE_URL"],
+                      "target_sha": os.environ["RELEASE_TARGET_SHA"],
+                  }
+                  if as_bool(os.environ["RELEASE_EXISTS"])
+                  else None
+              ),
+              "existing_modrinth_version": (
+                  {"id": os.environ["MODRINTH_ID"]}
+                  if as_bool(os.environ.get("MODRINTH_EXISTS", "false"))
+                  else None
+              ),
+          }
+          print(json.dumps(facts))
+          PYEOF
+          set +e
+          out="$(python3 scripts/release_state.py decide --facts "$RUNNER_TEMP/facts.json")"
+          set -e
+          echo "$out" > "$RUNNER_TEMP/decision.json"
+          state="$(echo "$out" | jq -r .state)"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "release_action=$(echo "$out" | jq -r .release_action)" >> "$GITHUB_OUTPUT"
+          echo "modrinth_action=$(echo "$out" | jq -r .modrinth_action)" >> "$GITHUB_OUTPUT"
+          echo "release_id=$(echo "$out" | jq -r .release_id)" >> "$GITHUB_OUTPUT"
+          echo "release_url=$(echo "$out" | jq -r .release_url)" >> "$GITHUB_OUTPUT"
+          echo "modrinth_version_id=$(echo "$out" | jq -r .modrinth_version_id)" >> "$GITHUB_OUTPUT"
+          echo "state=$state" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$state" = "failed" ]; then
+            echo "::error::$(echo "$out" | jq -r .error)"
+            exit 1
+          fi
+
+      # Non-mutating short-circuit outcomes (build-only / held / skipped):
+      # the job's final outputs are set here and no release/Modrinth step
+      # runs at all.
+      - name: Finalize non-mutating state
+        id: shortcircuit
+        if: contains(fromJSON('["build-only","held","skipped"]'), steps.decide.outputs.state)
+        run: |
+          echo "state=${{ steps.decide.outputs.state }}" >> "$GITHUB_OUTPUT"
+          echo "release-id=${{ steps.decide.outputs.release_id }}" >> "$GITHUB_OUTPUT"
+          echo "release-url=${{ steps.decide.outputs.release_url }}" >> "$GITHUB_OUTPUT"
+          echo "modrinth-version-id=${{ steps.decide.outputs.modrinth_version_id }}" >> "$GITHUB_OUTPUT"
+
+      - name: Write changelog to file
+        if: steps.decide.outputs.state == 'publishing'
+        id: changelog
+        env:
+          NOTES_FILE: ${{ inputs['notes-file'] }}
+        run: |
+          file="$RUNNER_TEMP/release-changelog.txt"
+          if [ -n "$NOTES_FILE" ]; then
+            cp -- "$NOTES_FILE" "$file"
+          else
+            printf '' > "$file"
+          fi
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        id: create_release
+        if: steps.decide.outputs.state == 'publishing' && steps.decide.outputs.release_action == 'create'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.validate.outputs.version }}
+          name: ${{ steps.pack.outputs.name }}
+          target_commitish: ${{ steps.validate.outputs.sha }}
+          generate_release_notes: ${{ inputs['notes-file'] == '' }}
+          body_path: ${{ inputs['notes-file'] != '' && steps.changelog.outputs.file || '' }}
+          files: build/*.mrpack
+
+      # action-gh-release's own `id` output is the release's node id, not a
+      # database id/URL pair we can feed straight into our outputs — look it
+      # up the same way the pre-existing-release path does, so both paths
+      # produce identically-shaped release-id/release-url outputs.
+      - name: Resolve created release identity
+        id: created_release
+        if: steps.decide.outputs.state == 'publishing' && steps.decide.outputs.release_action == 'create'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          out="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json databaseId,url)"
+          echo "id=$(echo "$out" | jq -r .databaseId)" >> "$GITHUB_OUTPUT"
+          echo "url=$(echo "$out" | jq -r .url)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve Modrinth targets
+        id: targets
+        if: steps.decide.outputs.state == 'publishing' && steps.decide.outputs.modrinth_action == 'create'
+        run: |
+          echo "minecraft=$(sed -n 's/^minecraft = "\(.*\)"/\1/p' pack.toml)" >> "$GITHUB_OUTPUT"
+          {
+            echo "loaders<<TARGETS_EOF"
+            sed -n -E 's/^(forge|fabric|neoforge|quilt) = ".*"/\1/p' pack.toml
+            echo "TARGETS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish to Modrinth
+        id: publish_modrinth
+        if: steps.decide.outputs.state == 'publishing' && steps.decide.outputs.modrinth_action == 'create'
+        env:
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
+          MRPACK_FILE: ${{ steps.mrpack.outputs.file }}
+          VERSION: ${{ steps.validate.outputs.version }}
+          CHANGELOG_FILE: ${{ steps.changelog.outputs.file }}
+          MINECRAFT: ${{ steps.targets.outputs.minecraft }}
+          LOADERS: ${{ steps.targets.outputs.loaders }}
+          CHANNEL: ${{ contains(steps.validate.outputs.version, '-') && 'beta' || 'release' }}
+          RINTH_REF: ${{ inputs.rinth-ref }}
+        run: |
+          loader_flags=()
+          while IFS= read -r loader; do
+            [ -n "$loader" ] && loader_flags+=(--loader "$loader")
+          done <<< "$LOADERS"
+
+          out="$(bunx --bun "github:brooswit-minecraft/rinth#${RINTH_REF}" publish "$PROJECT_ID" \
+            --file "$MRPACK_FILE" \
+            --version "$VERSION" \
+            --changelog-file "$CHANGELOG_FILE" \
+            --game-version "$MINECRAFT" \
+            "${loader_flags[@]}" \
+            --channel "$CHANNEL" \
+            --json)"
+          echo "id=$(echo "$out" | jq -r .id)" >> "$GITHUB_OUTPUT"
+
+      # Written only once the publishing branch's steps above have all
+      # succeeded (or were skipped because nothing of theirs applied) — the
+      # job output expression at the top of this file falls back to this
+      # step's "state" via `||`, so if the job fails partway through the
+      # publishing branch (e.g. the Modrinth step errors), this step never
+      # runs and the job's `state` output resolves to whatever
+      # `steps.decide` already wrote — i.e. it stays "publishing", not
+      # "published" and not silently "failed" — a true record of "the
+      # release exists, Modrinth did not confirm, retry is safe".
+      - name: Finalize publishing state
+        id: finalize
+        if: steps.decide.outputs.state == 'publishing'
+        run: |
+          release_id="${{ steps.decide.outputs.release_action == 'create' && steps.created_release.outputs.id || steps.decide.outputs.release_id }}"
+          release_url="${{ steps.decide.outputs.release_action == 'create' && steps.created_release.outputs.url || steps.decide.outputs.release_url }}"
+          modrinth_id="${{ steps.decide.outputs.modrinth_action == 'create' && steps.publish_modrinth.outputs.id || steps.decide.outputs.modrinth_version_id }}"
+          echo "state=published" >> "$GITHUB_OUTPUT"
+          echo "release-id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "release-url=$release_url" >> "$GITHUB_OUTPUT"
+          echo "modrinth-version-id=$modrinth_id" >> "$GITHUB_OUTPUT"

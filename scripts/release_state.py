@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Accepted-merge release contract: input validation and the publication
+state machine (MINECRAFT-371 implementing MINECRAFT-44).
+
+Extracted from .github/workflows/reusable-accepted-merge-release.yml so the
+decision logic is unit-testable without a GitHub Actions runner. The
+workflow shells out to `gh release view` and `rinth versions latest` to
+gather facts (existing release / existing Modrinth version, or None for
+"doesn't exist"), then calls `decide()` with those facts to get back one of
+six states: build-only, held, skipped, publishing, published, failed.
+
+`publishing` is never returned by `decide()` itself — it is a transient
+state the *workflow* writes to its job output after `decide()` says to
+create/reuse the GitHub Release but before the Modrinth step is attempted,
+so a run that fails during the Modrinth step still leaves a meaningful
+machine-readable state (recorded before 'failed' takes over): "the release
+exists; Modrinth is unresolved; retry is safe" — a retry's `decide()` call
+sees the now-existing release and does not recreate it.
+
+CLI usage (both subcommands print one JSON object to stdout and exit 0 on
+success; a validation/decision failure prints `{"error": "..."}` and exits
+1 so a workflow step can `::error::` it and stop):
+
+    release_state.py validate --sha <40-hex> --version <raw-version>
+    release_state.py decide --facts <path-to-json-or-->
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+([-.+][A-Za-z0-9.-]+)?$")
+
+STATES = ("build-only", "held", "skipped", "publishing", "published", "failed")
+
+
+class ContractError(ValueError):
+    """An actionable input/reconcile failure (never a bug in this script)."""
+
+
+def validate_sha(sha: str) -> str:
+    if not isinstance(sha, str) or not SHA_RE.match(sha):
+        raise ContractError(
+            f"sha must be an exact 40-character lowercase hex commit SHA, got {sha!r}"
+        )
+    return sha
+
+
+def validate_version(raw_version: str) -> str:
+    if not isinstance(raw_version, str) or not raw_version:
+        raise ContractError("version is required")
+    version = raw_version[1:] if raw_version.startswith("v") else raw_version
+    if not VERSION_RE.match(version):
+        raise ContractError(
+            f"version must be semver-like (e.g. 1.2.3 or 1.2.3-beta.1), got {raw_version!r}"
+        )
+    return version
+
+
+@dataclass
+class Decision:
+    state: str
+    release_action: str = "none"  # none | create | reuse
+    modrinth_action: str = "none"  # none | create | reuse
+    release_id: Optional[str] = None
+    release_url: Optional[str] = None
+    modrinth_version_id: Optional[str] = None
+    error: Optional[str] = None
+
+    def to_json(self) -> dict:
+        d = {
+            "state": self.state,
+            "release_action": self.release_action,
+            "modrinth_action": self.modrinth_action,
+            "release_id": self.release_id or "",
+            "release_url": self.release_url or "",
+            "modrinth_version_id": self.modrinth_version_id or "",
+        }
+        if self.error:
+            d["error"] = self.error
+        return d
+
+
+def decide(
+    *,
+    sha: str,
+    authorized: bool,
+    hold: bool,
+    modrinth_required: bool,
+    modrinth_configured: bool,
+    existing_release: Optional[dict],
+    existing_modrinth_version: Optional[dict],
+) -> Decision:
+    """`existing_release`: {"id": ..., "url": ..., "target_sha": ...} or None.
+    `existing_modrinth_version`: {"id": ...} or None.
+    Never raises — a reconcile failure is reported as state=failed.
+    """
+    if not authorized:
+        return Decision(state="build-only")
+
+    if hold:
+        return Decision(state="held")
+
+    release_action = "none"
+    release_id = release_url = None
+    if existing_release is not None:
+        if existing_release.get("target_sha") != sha:
+            return Decision(
+                state="failed",
+                error=(
+                    "a GitHub Release for this tag already exists but targets "
+                    f"{existing_release.get('target_sha')!r}, not the requested "
+                    f"sha {sha!r} — refusing to repoint an existing release"
+                ),
+            )
+        release_action = "reuse"
+        release_id = existing_release.get("id")
+        release_url = existing_release.get("url")
+    else:
+        release_action = "create"
+
+    if modrinth_required and not modrinth_configured:
+        return Decision(
+            state="failed",
+            error=(
+                "Modrinth publication is required for this call but "
+                "MODRINTH_TOKEN/MODRINTH_PROJECT_ID are not configured"
+            ),
+        )
+
+    modrinth_action = "none"
+    modrinth_version_id = None
+    if modrinth_configured:
+        if existing_modrinth_version is not None:
+            modrinth_action = "reuse"
+            modrinth_version_id = existing_modrinth_version.get("id")
+        else:
+            modrinth_action = "create"
+
+    if release_action == "reuse" and modrinth_action in ("none", "reuse"):
+        # Nothing new to do: a full replay of a previously-completed
+        # publish (DoD #2 — retries/overlapping events must not duplicate).
+        return Decision(
+            state="skipped",
+            release_action=release_action,
+            modrinth_action=modrinth_action,
+            release_id=release_id,
+            release_url=release_url,
+            modrinth_version_id=modrinth_version_id,
+        )
+
+    return Decision(
+        state="publishing",
+        release_action=release_action,
+        modrinth_action=modrinth_action,
+        release_id=release_id,
+        release_url=release_url,
+        modrinth_version_id=modrinth_version_id,
+    )
+
+
+def _cmd_validate(args: argparse.Namespace) -> dict:
+    sha = validate_sha(args.sha)
+    version = validate_version(args.version)
+    return {"sha": sha, "version": version}
+
+
+def _cmd_decide(args: argparse.Namespace) -> dict:
+    raw = sys.stdin.read() if args.facts == "-" else open(args.facts).read()
+    facts = json.loads(raw)
+    decision = decide(
+        sha=facts["sha"],
+        authorized=bool(facts["authorized"]),
+        hold=bool(facts["hold"]),
+        modrinth_required=bool(facts["modrinth_required"]),
+        modrinth_configured=bool(facts["modrinth_configured"]),
+        existing_release=facts.get("existing_release"),
+        existing_modrinth_version=facts.get("existing_modrinth_version"),
+    )
+    return decision.to_json()
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_validate = sub.add_parser("validate")
+    p_validate.add_argument("--sha", required=True)
+    p_validate.add_argument("--version", required=True)
+    p_validate.set_defaults(func=_cmd_validate)
+
+    p_decide = sub.add_parser("decide")
+    p_decide.add_argument("--facts", default="-", help="path to a JSON facts file, or - for stdin")
+    p_decide.set_defaults(func=_cmd_decide)
+
+    args = parser.parse_args(argv)
+    try:
+        result = args.func(args)
+    except ContractError as e:
+        print(json.dumps({"error": str(e)}))
+        return 1
+    print(json.dumps(result))
+    if args.cmd == "decide" and result.get("state") == "failed":
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
