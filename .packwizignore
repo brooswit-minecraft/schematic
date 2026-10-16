@@ -6,6 +6,7 @@ Makefile
 .packwizignore
 .github/
 .modrinth/
+docs/
 scripts/
 tests/
 build/
