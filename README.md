@@ -669,6 +669,51 @@ retrying. Never clear the marker automatically after a partial promotion.
 Unknown host keys are rejected; do not replace verification with `ssh-keyscan`
 trust-on-first-use. Downloaded pack contents must come from trusted releases.
 
+### Durable deployment state and stale-release ordering (MINECRAFT-40)
+
+A small JSON record, `.schematic-deploy-state.json` at the server root
+(`scripts/deploy_state.py`), tracks one of five durable states for the
+release that is (or was last) in flight: `requested`, `updating`, `healthy`,
+`failed`, `rolled_back` — each with the release version and a UTC timestamp.
+It survives across the separate `mark-requested`/`deploy`/`restart` CLI
+invocations that make up one `sftp`-route rollout (each its own workflow
+step/process), unlike in-memory state.
+
+Before anything else touches the server — before the optional world backup,
+before the RCON preflight — the workflow's first SFTP-touching step runs
+`server_deploy.py mark-requested`, which refuses (`ValueError: Stale
+release...`) when the candidate version is strictly older than whatever
+version the state record already shows as `updating` or `healthy`. This is
+independent of the `.schematic-deploy-pending` lock above, which only
+detects an in-progress upload; it does not order two completed-or-competing
+attempts by version. A request for the SAME version as what's already
+live/updating is allowed through (an ordinary retry); a `failed` or
+`rolled_back` record pins nothing live, so it never blocks a retry at any
+version. Versions must be dotted-numeric (`0.53.2`); anything else fails
+loudly rather than comparing unordered values as equal.
+
+`upload()` itself records `updating` right before the first live mutation
+(after every read-only pre-upload check — the same guard, the pending-marker
+check, the untracked-mods check, the existing-file-safety check — has
+already passed), then, after every promoted file is read back at its live
+path and re-hashed against the release manifest (`verify_installed_content`
+— independent of the staging-time hash check already done on the staged
+copy before the rename), promotes the manifest and clears the pending
+marker. `restart` records `healthy` once RCON confirms the restart,
+reading the version to record from the now-live manifest rather than
+trusting the caller's own notion of what it just deployed. A failure in
+either the `deploy` or `restart` CLI command best-effort records `failed`
+(never letting a secondary failure in that recording itself mask the
+original error); a job-level failure between those two steps is caught by
+a dedicated `if: failure()` workflow step running `mark-failed`.
+
+`rolled_back` is recording-only: `server_deploy.py mark-rolled-back
+[--version X]` durably records that a release was rolled back, but performs
+no live rollback action itself and is not wired into the automated
+workflow — rollback execution is a separate, not-yet-implemented/authorized
+concern. An operator (or a future automated rollback) calls it after the
+fact as the record of what happened.
+
 ### Pre-deploy world archive (opt-in)
 
 `sftp`-route only, off by default, over the SFTP access the route already has — no

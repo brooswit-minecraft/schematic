@@ -19,6 +19,7 @@ import zipfile
 SPEC = importlib.util.spec_from_file_location("deploy", Path(__file__).parents[1] / "scripts/server_deploy.py")
 deploy = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(deploy)
+deploy_state = deploy.deploy_state  # the sibling module server_deploy.py itself imports
 
 
 def entry(path="mods/example.jar", data=b"server", server="required"):
@@ -227,6 +228,69 @@ class DeploymentTest(unittest.TestCase):
         self.assertEqual((self.remote / "server/mods/example.jar").read_bytes(), b"server")
         self.assertFalse((self.remote / "server" / deploy.PENDING).exists())
         self.assertFalse(list((self.remote / "server").glob(".schematic-stage-*")))
+
+    def materialize_version(self, version, entries=None):
+        """Unlike self.materialize() (which hardcodes "1.2.3"), builds and
+        materializes a pack at an explicit version — needed to exercise
+        the stale-release ordering guard across two different versions."""
+        archive = self.pack(entries=entries, version=version)
+        return deploy.materialize(archive, self.output, version, fetch=lambda _: io.BytesIO(b"server"))
+
+    def test_upload_records_updating_state_for_the_deployed_version(self):
+        self.materialize_version("1.2.3")
+        deploy.upload(self.sftp, self.output, "/server")
+        record = json.loads((self.remote / "server" / ".schematic-deploy-state.json").read_text())
+        self.assertEqual(record["state"], "updating")
+        self.assertEqual(record["version"], "1.2.3")
+
+    def test_stale_older_release_refused_without_mutation(self):
+        self.materialize_version("2.0.0")
+        deploy.upload(self.sftp, self.output, "/server")
+        promotions_after_first_deploy = self.sftp.promotions
+        shutil.rmtree(self.output)
+        self.materialize_version("1.2.3")
+        with self.assertRaisesRegex(ValueError, "Stale release"):
+            deploy.upload(self.sftp, self.output, "/server")
+        self.assertEqual(self.sftp.promotions, promotions_after_first_deploy)
+        self.assertFalse((self.remote / "server" / deploy.PENDING).exists())
+        self.assertEqual((self.remote / "server/mods/example.jar").read_bytes(), b"server")
+
+    def test_equal_version_redeploy_allowed_after_upload(self):
+        self.materialize_version("1.2.3")
+        deploy.upload(self.sftp, self.output, "/server")
+        shutil.rmtree(self.output)
+        self.materialize_version("1.2.3")
+        deploy.upload(self.sftp, self.output, "/server")  # no exception: same-version retry
+
+    def test_newer_release_allowed_over_older_one(self):
+        self.materialize_version("1.2.3")
+        deploy.upload(self.sftp, self.output, "/server")
+        shutil.rmtree(self.output)
+        self.materialize_version("1.3.0", entries=[entry("mods/newer.jar")])
+        deploy.upload(self.sftp, self.output, "/server")  # no exception
+        self.assertTrue((self.remote / "server/mods/newer.jar").exists())
+
+    def test_verify_installed_content_passes_on_a_clean_upload(self):
+        self.materialize_version("1.2.3")
+        deploy.upload(self.sftp, self.output, "/server")
+        manifest = json.loads((self.output / deploy.MANIFEST).read_text())
+        deploy.verify_installed_content(self.sftp, "/server", manifest)  # no exception
+
+    def test_verify_installed_content_catches_live_file_corruption(self):
+        self.materialize_version("1.2.3")
+        deploy.upload(self.sftp, self.output, "/server")
+        manifest = json.loads((self.output / deploy.MANIFEST).read_text())
+        (self.remote / "server/mods/example.jar").write_bytes(b"corrupted after promotion")
+        with self.assertRaisesRegex(ValueError, "does not match the release manifest after promotion"):
+            deploy.verify_installed_content(self.sftp, "/server", manifest)
+
+    def test_verify_installed_content_catches_missing_live_file(self):
+        self.materialize_version("1.2.3")
+        deploy.upload(self.sftp, self.output, "/server")
+        manifest = json.loads((self.output / deploy.MANIFEST).read_text())
+        (self.remote / "server/mods/example.jar").unlink()
+        with self.assertRaisesRegex(ValueError, "missing after promotion"):
+            deploy.verify_installed_content(self.sftp, "/server", manifest)
 
     def test_supervisor_is_installed_atomically_and_executable(self):
         deploy.install_supervisor(self.sftp, "/server")
@@ -718,6 +782,111 @@ class DeploymentTest(unittest.TestCase):
         output = stderr.getvalue()
         self.assertIn("RuntimeError", output)
         self.assertNotIn("topsecret", output)
+
+
+class DeployStateWiringTest(unittest.TestCase):
+    """MINECRAFT-40: the CLI-level mark-requested/healthy/failed/rolled-back
+    helpers, exercised against FakeSFTP with sftp_session patched out (no
+    real network/credentials), matching the existing deploy()-level tests'
+    mock.patch.object(deploy, ...) pattern."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.remote = self.root / "remote"
+        (self.remote / "server").mkdir(parents=True)
+        self.sftp = FakeSFTP(self.remote)
+        self.env = {"SERVER_SFTP_PATH": "/server"}
+
+    @contextlib.contextmanager
+    def fake_session(self, _env):
+        yield self.sftp
+
+    def write_manifest(self, output_dir, version, files=None):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / deploy.MANIFEST).write_text(json.dumps(
+            {"schema": 1, "version": version, "dependencies": {}, "files": files or {}}))
+
+    def write_live_manifest(self, version):
+        (self.remote / "server" / deploy.MANIFEST).write_text(json.dumps(
+            {"schema": 1, "version": version, "dependencies": {}, "files": {}}))
+
+    def test_mark_requested_records_state_and_guards_staleness(self):
+        output = self.root / "output"
+        self.write_manifest(output, "1.0.0")
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            deploy.connect_mark_requested(str(output), self.env)
+        record = json.loads((self.remote / "server" / ".schematic-deploy-state.json").read_text())
+        self.assertEqual((record["state"], record["version"]), ("requested", "1.0.0"))
+
+        # Once 1.0.0 is actually live (updating/healthy), a request for an
+        # older version must be refused — a bare "requested" record (above)
+        # pins nothing live yet, so it alone would not have blocked this.
+        deploy_state.write_state(self.sftp, "/server", "1.0.0", deploy_state.HEALTHY, now=deploy.utcnow)
+        older_output = self.root / "older-output"
+        self.write_manifest(older_output, "0.9.0")
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            with self.assertRaisesRegex(ValueError, "Stale release"):
+                deploy.connect_mark_requested(str(older_output), self.env)
+
+    def test_mark_healthy_reads_version_from_the_live_manifest(self):
+        self.write_live_manifest("1.2.3")
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            record = deploy.connect_mark_healthy(self.env)
+        self.assertEqual((record["state"], record["version"]), ("healthy", "1.2.3"))
+
+    def test_mark_failed_with_explicit_version(self):
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            record = deploy.connect_mark_failed(self.env, version="1.2.3")
+        self.assertEqual((record["state"], record["version"]), ("failed", "1.2.3"))
+
+    def test_mark_failed_falls_back_to_the_recorded_candidate_version(self):
+        deploy_state.write_state(self.sftp, "/server", "1.2.3", deploy_state.UPDATING, now=deploy.utcnow)
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            record = deploy.connect_mark_failed(self.env)
+        self.assertEqual((record["state"], record["version"]), ("failed", "1.2.3"))
+
+    def test_mark_failed_without_any_known_version_raises(self):
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            with self.assertRaisesRegex(ValueError, "no candidate version"):
+                deploy.connect_mark_failed(self.env)
+
+    def test_mark_rolled_back_with_explicit_version(self):
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            record = deploy.connect_mark_rolled_back(self.env, version="0.9.0")
+        self.assertEqual((record["state"], record["version"]), ("rolled_back", "0.9.0"))
+
+    def test_restart_and_mark_healthy_skips_silently_without_sftp_config(self):
+        with mock.patch.object(deploy, "restart_and_wait", return_value="online") as restart_fn, \
+             mock.patch.object(deploy, "sftp_session") as session:
+            result = deploy.restart_and_mark_healthy({})
+        self.assertEqual(result, "online")
+        restart_fn.assert_called_once()
+        session.assert_not_called()
+        self.assertFalse((self.remote / "server" / ".schematic-deploy-state.json").exists())
+
+    def test_restart_and_mark_healthy_marks_healthy_when_sftp_is_configured(self):
+        self.write_live_manifest("1.2.3")
+        with mock.patch.object(deploy, "restart_and_wait", return_value="online"), \
+             mock.patch.object(deploy, "sftp_session", self.fake_session), \
+             mock.patch.object(deploy, "upload_config", return_value=22):
+            result = deploy.restart_and_mark_healthy(self.env)
+        self.assertEqual(result, "online")
+        record = json.loads((self.remote / "server" / ".schematic-deploy-state.json").read_text())
+        self.assertEqual(record["state"], "healthy")
+
+    def test_mark_failed_best_effort_swallows_its_own_errors(self):
+        with mock.patch.object(deploy, "connect_mark_failed", side_effect=RuntimeError("no sftp")):
+            deploy.mark_failed_best_effort({}, output_dir=None)  # must not raise
+
+    def test_mark_failed_best_effort_reads_candidate_version_from_output(self):
+        output = self.root / "output"
+        self.write_manifest(output, "1.0.0")
+        with mock.patch.object(deploy, "connect_mark_failed") as mark_failed:
+            deploy.mark_failed_best_effort({}, output_dir=str(output))
+        mark_failed.assert_called_once_with({}, version="1.0.0")
 
 
 if __name__ == "__main__":
