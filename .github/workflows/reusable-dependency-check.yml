@@ -3,7 +3,8 @@ name: Reusable dependency check
 # MINECRAFT-38. Callable from a consumer's thin stub. Fails if any pinned
 # mod's REQUIRED NeoForge dependency is not provided (in range) by another
 # pinned jar or a nested jarjar jar. Runs against the CALLER's checkout; the
-# script comes from this repo at v1 (same pattern as reusable-server-update).
+# script comes from this repo at an immutable commit SHA (the ref below), so the
+# checker code is reproducible; bump it together with the consumer's pin.
 #
 # It downloads each pinned file from its packwiz download.url (unauthenticated
 # GETs, hash-verified against the pin). It does not call the Modrinth API and
@@ -33,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: brooswit-minecraft/schematic
-          ref: v1
+          ref: b64567618fcc400f156de4701eb4ffc25de0d672
           path: .schematic-tools
           persist-credentials: false
       - uses: actions/setup-python@v5

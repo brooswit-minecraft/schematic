@@ -95,25 +95,25 @@ on:
     outputs:
       state:
         description: 'One of: build-only, held, skipped, publishing, published, failed.'
-        value: ${{ jobs.release.outputs.state }}
+        value: ${{ jobs.outcome.outputs.state }}
       sha:
         description: 'The exact source SHA this run built from (echoes the input).'
-        value: ${{ jobs.release.outputs.sha }}
+        value: ${{ jobs.outcome.outputs.sha }}
       version:
         description: 'The validated, normalized version (no leading v).'
-        value: ${{ jobs.release.outputs.version }}
+        value: ${{ jobs.outcome.outputs.version }}
       artifact-name:
         description: 'Name of the uploaded .mrpack workflow artifact.'
-        value: ${{ jobs.release.outputs.artifact-name }}
+        value: ${{ jobs.outcome.outputs.artifact-name }}
       release-id:
         description: 'GitHub Release id, when a release exists for this run (reused or created).'
-        value: ${{ jobs.release.outputs.release-id }}
+        value: ${{ jobs.outcome.outputs.release-id }}
       release-url:
         description: 'GitHub Release URL, when a release exists for this run.'
-        value: ${{ jobs.release.outputs.release-url }}
+        value: ${{ jobs.outcome.outputs.release-url }}
       modrinth-version-id:
         description: 'Modrinth version id, when a Modrinth version exists for this run (reused or created).'
-        value: ${{ jobs.release.outputs.modrinth-version-id }}
+        value: ${{ jobs.outcome.outputs.modrinth-version-id }}
 
 jobs:
   # Validates inputs and resolves the canonical (no leading "v") version
@@ -186,13 +186,13 @@ jobs:
       group: accepted-merge-release-${{ github.repository }}-${{ needs.normalize.outputs.version }}
       cancel-in-progress: false
     outputs:
-      state: ${{ steps.finalize.outputs.state || steps.shortcircuit.outputs.state || 'failed' }}
+      state: ${{ steps.finalize.outputs.state || steps.checkpoint.outputs.state || steps.shortcircuit.outputs.state || 'failed' }}
       sha: ${{ needs.normalize.outputs.sha }}
       version: ${{ needs.normalize.outputs.version }}
       artifact-name: ${{ steps.pack.outputs.name }}
-      release-id: ${{ steps.finalize.outputs.release-id || steps.shortcircuit.outputs.release-id }}
-      release-url: ${{ steps.finalize.outputs.release-url || steps.shortcircuit.outputs.release-url }}
-      modrinth-version-id: ${{ steps.finalize.outputs.modrinth-version-id || steps.shortcircuit.outputs.modrinth-version-id }}
+      release-id: ${{ steps.finalize.outputs.release-id || steps.checkpoint.outputs.release-id || steps.shortcircuit.outputs.release-id }}
+      release-url: ${{ steps.finalize.outputs.release-url || steps.checkpoint.outputs.release-url || steps.shortcircuit.outputs.release-url }}
+      modrinth-version-id: ${{ steps.finalize.outputs.modrinth-version-id || steps.checkpoint.outputs.modrinth-version-id || steps.shortcircuit.outputs.modrinth-version-id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -327,6 +327,7 @@ jobs:
       # points at; a lightweight tag resolves to the commit directly either
       # way.
       - name: Look up existing release tag
+        if: inputs.authorized && !inputs.hold
         id: existing_tag
         env:
           VERSION: ${{ needs.normalize.outputs.version }}
@@ -339,25 +340,38 @@ jobs:
           fi
 
       - name: Look up existing GitHub Release object
+        if: inputs.authorized && !inputs.hold
         id: existing_release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.normalize.outputs.version }}
         run: |
-          if out="$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json databaseId,url 2>/dev/null)"; then
+          # Only a verified 404 means absent. Permission, rate-limit, and
+          # transport errors must not select a potentially destructive create.
+          response="$RUNNER_TEMP/github-release-response"
+          code=0
+          gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/v$VERSION" > "$response" || code=$?
+          status="$(awk '/^HTTP\// {print $2; exit}' "$response")"
+          if [ "$code" -eq 0 ] && [ "$status" = 200 ]; then
+            body="$(sed '1,/^\r\{0,1\}$/d' "$response")"
+            id="$(echo "$body" | jq -er '.id | select(type == "number")')"
+            url="$(echo "$body" | jq -er '.html_url | select(type == "string" and length > 0)')"
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "id=$(echo "$out" | jq -r .databaseId)" >> "$GITHUB_OUTPUT"
-            echo "url=$(echo "$out" | jq -r .url)" >> "$GITHUB_OUTPUT"
-          else
+            echo "id=$id" >> "$GITHUB_OUTPUT"
+            echo "url=$url" >> "$GITHUB_OUTPUT"
+          elif [ "$status" = 404 ]; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::GitHub Release lookup failed (HTTP ${status:-unknown}, exit $code); refusing to assume the release is absent"
+            exit 1
           fi
 
       - uses: oven-sh/setup-bun@v2
-        if: steps.modrinth_check.outputs.configured == 'true'
+        if: inputs.authorized && !inputs.hold && steps.modrinth_check.outputs.configured == 'true'
 
       - name: Look up existing Modrinth version
         id: existing_modrinth
-        if: steps.modrinth_check.outputs.configured == 'true'
+        if: inputs.authorized && !inputs.hold && steps.modrinth_check.outputs.configured == 'true'
         env:
           MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
           PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
@@ -501,6 +515,21 @@ jobs:
           echo "id=$(echo "$out" | jq -r .databaseId)" >> "$GITHUB_OUTPUT"
           echo "url=$(echo "$out" | jq -r .url)" >> "$GITHUB_OUTPUT"
 
+      # Record publication only after the GitHub Release identity is known.
+      # This survives a later Modrinth failure and makes a retry actionable.
+      - name: Record GitHub publication checkpoint
+        id: checkpoint
+        if: steps.decide.outputs.state == 'publishing'
+        env:
+          RELEASE_ID: ${{ steps.created_release.outputs.id || steps.decide.outputs.release_id }}
+          RELEASE_URL: ${{ steps.created_release.outputs.url || steps.decide.outputs.release_url }}
+          MODRINTH_ID: ${{ steps.decide.outputs.modrinth_version_id }}
+        run: |
+          echo "state=publishing" >> "$GITHUB_OUTPUT"
+          echo "release-id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+          echo "release-url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
+          echo "modrinth-version-id=$MODRINTH_ID" >> "$GITHUB_OUTPUT"
+
       - name: Resolve Modrinth targets
         id: targets
         if: steps.decide.outputs.state == 'publishing' && steps.decide.outputs.modrinth_action == 'create'
@@ -541,15 +570,9 @@ jobs:
             --json)"
           echo "id=$(echo "$out" | jq -r .id)" >> "$GITHUB_OUTPUT"
 
-      # Written only once the publishing branch's steps above have all
-      # succeeded (or were skipped because nothing of theirs applied) — the
-      # job output expression at the top of this file falls back to this
-      # step's "state" via `||`, so if the job fails partway through the
-      # publishing branch (e.g. the Modrinth step errors), this step never
-      # runs and the job's `state` output resolves to whatever
-      # `steps.decide` already wrote — i.e. it stays "publishing", not
-      # "published" and not silently "failed" — a true record of "the
-      # release exists, Modrinth did not confirm, retry is safe".
+      # Only a successful publishing branch supersedes the checkpoint.
+      # Earlier failures stay failed; failures after GitHub publication retain
+      # publishing and the known release identity for reconciliation on retry.
       - name: Finalize publishing state
         id: finalize
         if: steps.decide.outputs.state == 'publishing'
@@ -561,3 +584,28 @@ jobs:
           echo "release-id=$release_id" >> "$GITHUB_OUTPUT"
           echo "release-url=$release_url" >> "$GITHUB_OUTPUT"
           echo "modrinth-version-id=$modrinth_id" >> "$GITHUB_OUTPUT"
+
+  # Always expose a contract state, including when normalization fails and the
+  # release job is skipped. This does not turn a failed workflow green.
+  outcome:
+    name: Report release outcome
+    if: ${{ always() }}
+    needs: [normalize, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      state: ${{ needs.release.outputs.state || 'failed' }}
+      sha: ${{ needs.normalize.outputs.sha }}
+      version: ${{ needs.normalize.outputs.version }}
+      artifact-name: ${{ needs.release.outputs.artifact-name }}
+      release-id: ${{ needs.release.outputs.release-id }}
+      release-url: ${{ needs.release.outputs.release-url }}
+      modrinth-version-id: ${{ needs.release.outputs.modrinth-version-id }}
+    steps:
+      - name: Preserve upstream failure status
+        env:
+          NORMALIZE_RESULT: ${{ needs.normalize.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+        run: |
+          [ "$NORMALIZE_RESULT" = success ] && [ "$RELEASE_RESULT" = success ]

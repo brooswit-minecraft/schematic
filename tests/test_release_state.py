@@ -27,6 +27,10 @@ class ValidateSha(unittest.TestCase):
     def test_accepts_full_lowercase_sha(self):
         self.assertEqual(rs.validate_sha(SHA_A), SHA_A)
 
+    def test_rejects_trailing_newline_sha(self):
+        with self.assertRaises(rs.ContractError):
+            rs.validate_sha(SHA_A + "\n")
+
     def test_rejects_short_sha(self):
         with self.assertRaises(rs.ContractError):
             rs.validate_sha(SHA_A[:7])
@@ -47,6 +51,10 @@ class ValidateSha(unittest.TestCase):
 class ValidateVersion(unittest.TestCase):
     def test_accepts_plain_semver(self):
         self.assertEqual(rs.validate_version("1.2.3"), "1.2.3")
+
+    def test_rejects_trailing_newline_version(self):
+        with self.assertRaises(rs.ContractError):
+            rs.validate_version("1.2.3\n")
 
     def test_strips_leading_v(self):
         self.assertEqual(rs.validate_version("v1.2.3"), "1.2.3")

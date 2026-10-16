@@ -14,13 +14,12 @@ or None for "doesn't exist"), then calls `decide()` with those facts to get
 back one of six states: build-only, held, skipped, publishing, published,
 failed.
 
-`publishing` is never returned by `decide()` itself — it is a transient
-state the *workflow* writes to its job output after `decide()` says to
-create/reuse the GitHub Release but before the Modrinth step is attempted,
-so a run that fails during the Modrinth step still leaves a meaningful
-machine-readable state (recorded before 'failed' takes over): "the release
-exists; Modrinth is unresolved; retry is safe" — a retry's `decide()` call
-sees the now-existing release and does not recreate it.
+`publishing` returned by `decide()` authorizes the workflow's publication
+branch. The externally visible publishing checkpoint is written only once
+the GitHub Release identity is known, before Modrinth publication. A later
+failure retains that checkpoint and identity; earlier failures expose
+failed. A retry reconciles against the existing release rather than
+recreating it.
 
 CLI usage (both subcommands print one JSON object to stdout and exit 0 on
 success; a validation/decision failure prints `{"error": "..."}` and exits
@@ -50,7 +49,7 @@ class ContractError(ValueError):
 
 
 def validate_sha(sha: str) -> str:
-    if not isinstance(sha, str) or not SHA_RE.match(sha):
+    if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
         raise ContractError(
             f"sha must be an exact 40-character lowercase hex commit SHA, got {sha!r}"
         )
@@ -61,7 +60,7 @@ def validate_version(raw_version: str) -> str:
     if not isinstance(raw_version, str) or not raw_version:
         raise ContractError("version is required")
     version = raw_version[1:] if raw_version.startswith("v") else raw_version
-    if not VERSION_RE.match(version):
+    if not VERSION_RE.fullmatch(version):
         raise ContractError(
             f"version must be semver-like (e.g. 1.2.3 or 1.2.3-beta.1), got {raw_version!r}"
         )

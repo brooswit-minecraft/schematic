@@ -48,10 +48,15 @@ to something that was actually checked to contain the helper.
 `324ed36482cf43b82bf8de136373bcb65d68c572` on this repo's `MINECRAFT-371`
 branch contains `scripts/release_state.py` (verify with `gh api
 repos/brooswit-minecraft/schematic/contents/scripts/release_state.py?ref=324ed36482cf43b82bf8de136373bcb65d68c572`).
-Once this PR merges into `MINECRAFT-44` and that merges to `main`, pin
+MINECRAFT-371 is the implementation owner; MINECRAFT-44 remains closed.
+Once this PR merges directly to `main`, pin
 `schematic-ref` to the resulting commit SHA on `main` instead (verify the
 same way); once a `v1` tag is next cut on a commit at or after that merge,
 pin to `v1` again.
+
+The existing main-branch tag maintenance advances `v1` after integration.
+Before that succeeds, use a reviewed commit containing this workflow for
+both the `uses` ref and `schematic-ref`; do not assume the old `v1` has it.
 
 ## Calling it
 
@@ -83,7 +88,7 @@ jobs:
 | `rinth-ref` | no (default `v0.9.1`) | string | Pinned `brooswit-minecraft/rinth` tag invoked via `bunx`. |
 | `schematic-ref` | **yes, no default** | string | Exact `brooswit-minecraft/schematic` commit SHA (or tag, once one exists that contains the helper) this workflow checks its own mechanism helper (`scripts/release_state.py`) out from. See "a concrete, currently-valid example" above. A value that doesn't contain the helper fails fast with an actionable error (see above), not silently. |
 
-An invalid `sha` or `version` fails the run before any checkout/build step
+An invalid `sha` or `version` fails the run before any consumer checkout/build step
 with an actionable `::error::`.
 
 ## Outputs
@@ -104,10 +109,12 @@ tested in `tests/test_release_state.py` independent of any runner.
 
 1. **`build-only`** — `authorized` is `false`. The pack is built and
    uploaded as a workflow artifact; nothing is released or published.
-   Always a successful (green) run.
+   A successful build returns this state; build failures return `failed`.
+   External release/Modrinth reconciliation is not run.
 2. **`held`** — `authorized` is `true` but `hold` is `true`. Same
    build-only behavior, but distinguishes "paused despite being eligible"
-   from "not eligible" for anyone reading `state`.
+   from "not eligible" for anyone reading `state`. External reconciliation
+   is not run; build failures still return `failed`.
 3. **`skipped`** — `authorized` is `true`, `hold` is `false`, and
    reconciliation finds that **both** the target GitHub Release and (when
    Modrinth applies) the Modrinth version already exist and match this
