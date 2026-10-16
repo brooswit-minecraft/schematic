@@ -27,6 +27,15 @@ tag, cut before this helper existed) fails loudly with an actionable
 `::error::` naming the problem, not a confusing Python traceback three
 steps later.
 
+`schematic-ref` is resolved to an exact commit SHA exactly **once** — in
+the `normalize` job, immediately after its own mechanism checkout — and
+that resolved SHA (not the raw `schematic-ref` input) is what the
+`release` job's own mechanism checkout pins to (`needs.normalize.outputs.schematic-sha`).
+If `schematic-ref` names a tag or branch rather than an exact SHA, this is
+what guarantees both jobs execute the identical mechanism revision even if
+that ref moved between the two checkouts, rather than each job resolving
+`schematic-ref` independently and risking two different commits.
+
 **Why `schematic-ref` has no default**: `v1` is this repo's existing stable
 tag, but it predates `reusable-accepted-merge-release.yml` entirely and
 does not contain `scripts/release_state.py` — defaulting to it would be a

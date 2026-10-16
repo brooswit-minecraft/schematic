@@ -128,6 +128,7 @@ jobs:
     outputs:
       sha: ${{ steps.validate.outputs.sha }}
       version: ${{ steps.validate.outputs.version }}
+      schematic-sha: ${{ steps.resolve_schematic_sha.outputs.sha }}
     steps:
       - name: Check out schematic mechanism helper
         uses: actions/checkout@v4
@@ -135,6 +136,18 @@ jobs:
           repository: brooswit-minecraft/schematic
           ref: ${{ inputs.schematic-ref }}
           path: .schematic-mechanism
+
+      # Resolved ONCE, here, and threaded through to the `release` job as
+      # an exact commit SHA (`schematic-sha` output) rather than having
+      # that job independently re-resolve `schematic-ref` itself. If
+      # `schematic-ref` names a tag or branch, two independent resolutions
+      # of the same input could in principle land on different commits if
+      # the ref moved between them (a TOCTOU window — however narrow); both
+      # jobs now use the one commit pinned here instead.
+      - name: Resolve schematic-ref to an exact commit SHA
+        id: resolve_schematic_sha
+        working-directory: .schematic-mechanism
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Confirm the mechanism helper exists at schematic-ref
         env:
@@ -197,19 +210,28 @@ jobs:
             exit 1
           fi
 
+      # Pinned to `needs.normalize.outputs.schematic-sha` — the exact commit
+      # `normalize` already resolved `schematic-ref` to — rather than
+      # re-resolving `inputs.schematic-ref` independently here, so both jobs
+      # are guaranteed to execute the identical mechanism revision even if
+      # `schematic-ref` names a moving tag/branch.
       - name: Check out schematic mechanism helper
         uses: actions/checkout@v4
         with:
           repository: brooswit-minecraft/schematic
-          ref: ${{ inputs.schematic-ref }}
+          ref: ${{ needs.normalize.outputs.schematic-sha }}
           path: .schematic-mechanism
 
-      - name: Confirm the mechanism helper exists at schematic-ref
+      # Defense in depth only: `normalize` already checked this against the
+      # same resolved commit (schematic-sha), so this should be unreachable
+      # — but this job doesn't otherwise re-verify anything about that
+      # checkout, and the check is cheap.
+      - name: Confirm the mechanism helper exists at the resolved schematic commit
         env:
-          SCHEMATIC_REF: ${{ inputs.schematic-ref }}
+          SCHEMATIC_SHA: ${{ needs.normalize.outputs.schematic-sha }}
         run: |
           if [ ! -f .schematic-mechanism/scripts/release_state.py ]; then
-            echo "::error::schematic-ref '$SCHEMATIC_REF' does not contain scripts/release_state.py — pin schematic-ref to a brooswit-minecraft/schematic commit SHA (or, once one exists, a tag) that includes this file. See docs/accepted-merge-release-contract.md for a concrete example."
+            echo "::error::resolved schematic commit '$SCHEMATIC_SHA' does not contain scripts/release_state.py — pin schematic-ref to a brooswit-minecraft/schematic commit SHA (or, once one exists, a tag) that includes this file. See docs/accepted-merge-release-contract.md for a concrete example."
             exit 1
           fi
 
