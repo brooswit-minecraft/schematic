@@ -679,18 +679,31 @@ It survives across the separate `mark-requested`/`deploy`/`restart` CLI
 invocations that make up one `sftp`-route rollout (each its own workflow
 step/process), unlike in-memory state.
 
+The record tracks two things, deliberately kept separate: a `version`/`state`
+pair for the MOST RECENT ATTEMPT (whatever `mark-requested`/`upload`/`restart`/
+`mark-failed`/`mark-rolled-back` last wrote), and a separate `installed_version`
+— the highest version this record has ever seen reach `updating` or `healthy`.
+`installed_version` only ever moves forward: a `requested`/`failed`/
+`rolled_back` write for some other version updates the "current attempt"
+fields but carries `installed_version` forward untouched. This split exists
+because a single "current attempt" field is not durable ordering protection
+on its own — once a later attempt's own `requested`/`failed` record
+overwrites it, there is nothing left to compare a new candidate against
+(caught in review: `healthy(2)` -> `requested(3)` -> a stale `candidate(1)`
+must still be rejected, even though the "current attempt" by then reads
+`requested`/`3`, not `healthy`/`2`).
+
 Before anything else touches the server — before the optional world backup,
 before the RCON preflight — the workflow's first SFTP-touching step runs
 `server_deploy.py mark-requested`, which refuses (`ValueError: Stale
-release...`) when the candidate version is strictly older than whatever
-version the state record already shows as `updating` or `healthy`. This is
-independent of the `.schematic-deploy-pending` lock above, which only
-detects an in-progress upload; it does not order two completed-or-competing
-attempts by version. A request for the SAME version as what's already
-live/updating is allowed through (an ordinary retry); a `failed` or
-`rolled_back` record pins nothing live, so it never blocks a retry at any
-version. Versions must be dotted-numeric (`0.53.2`); anything else fails
-loudly rather than comparing unordered values as equal.
+release...`) when the candidate version is strictly older than
+`installed_version`. This is independent of the `.schematic-deploy-pending`
+lock above, which only detects an in-progress upload; it does not order two
+completed-or-competing attempts by version. A request for the SAME version
+as `installed_version` is allowed through (an ordinary retry); no record
+yet, or one whose `installed_version` is still unset, blocks nothing.
+Versions must be dotted-numeric (`0.53.2`); anything else fails loudly
+rather than comparing unordered values as equal.
 
 `upload()` itself records `updating` right before the first live mutation
 (after every read-only pre-upload check — the same guard, the pending-marker
@@ -705,7 +718,15 @@ trusting the caller's own notion of what it just deployed. A failure in
 either the `deploy` or `restart` CLI command best-effort records `failed`
 (never letting a secondary failure in that recording itself mask the
 original error); a job-level failure between those two steps is caught by
-a dedicated `if: failure()` workflow step running `mark-failed`.
+a dedicated `if: failure()` workflow step running `mark-failed`, gated on
+the `deploy` step itself having already succeeded (so it can never fire
+for a failure that happened before any file of THIS run was ever
+promoted). Every one of these no-explicit-version call sites resolves the
+version to mark from the LIVE manifest, never from the state record's own
+"current attempt" fields — the state record can belong to an entirely
+different, unrelated attempt by the time a failure handler runs, which
+would otherwise silently mislabel whichever release that record currently
+names (also caught in review).
 
 `rolled_back` is recording-only: `server_deploy.py mark-rolled-back
 [--version X]` durably records that a release was rolled back, but performs

@@ -623,41 +623,60 @@ def connect_mark_requested(output, env=os.environ):
         return deploy_state.write_state(sftp, root, new["version"], deploy_state.REQUESTED, now=utcnow)
 
 
+def live_manifest_version(sftp, root):
+    """The version on the currently-promoted live manifest, or None.
+    Deliberately NOT the deploy-state record's own version: that record
+    names whichever attempt last wrote it, which by the time a failure
+    or rollback handler runs may belong to an entirely different,
+    unrelated run (flagged in PR #63 review — see connect_mark_failed and
+    connect_mark_rolled_back below). The live manifest instead names
+    whatever this server's pack files actually, currently are — the one
+    unambiguous fallback when no version is given explicitly."""
+    manifest = read_manifest(sftp, root.rstrip("/") + "/" + MANIFEST)
+    version = manifest.get("version")
+    return version if isinstance(version, str) else None
+
+
 def connect_mark_healthy(env=os.environ):
     """After a verified restart, record HEALTHY against whichever version
     is actually live (read back from the promoted manifest on the server,
     not whatever the caller thinks it just deployed)."""
     with sftp_session(env) as sftp:
         root = env["SERVER_SFTP_PATH"]
-        manifest = read_manifest(sftp, root.rstrip("/") + "/" + MANIFEST)
-        version = manifest.get("version")
-        if not isinstance(version, str):
+        version = live_manifest_version(sftp, root)
+        if version is None:
             raise ValueError("Cannot mark healthy: live manifest has no release version on record")
         return deploy_state.write_state(sftp, root, version, deploy_state.HEALTHY, now=utcnow)
 
 
 def connect_mark_failed(env=os.environ, version=None):
-    """Record FAILED for `version`, or for whatever version the durable
-    state record already names when `version` is not given — covers a
-    failure mid-deploy, before the caller necessarily knows the candidate
-    version itself (e.g. a restart-side failure)."""
+    """Record FAILED for `version`, or — when not given — for whatever
+    version is on the LIVE manifest. Both of this fallback's real callers
+    (a restart-command failure, or the job-level catch-all workflow step)
+    only ever run after `deploy` has already succeeded in the SAME job,
+    so the live manifest at that point is guaranteed to be THIS run's own
+    candidate, not some other run's — unlike the deploy-state record's
+    current attempt, which the fallback deliberately does not read (see
+    live_manifest_version's docstring)."""
     with sftp_session(env) as sftp:
         root = env["SERVER_SFTP_PATH"]
-        target_version = version or (deploy_state.read_state(sftp, root) or {}).get("version")
+        target_version = version or live_manifest_version(sftp, root)
         if not target_version:
-            raise ValueError("Cannot mark failed: no candidate version on record and none given")
+            raise ValueError("Cannot mark failed: no candidate version given and the live manifest has none on record")
         return deploy_state.write_state(sftp, root, target_version, deploy_state.FAILED, now=utcnow)
 
 
 def connect_mark_rolled_back(env=os.environ, version=None):
-    """Record ROLLED_BACK for `version` (or the current state record's
-    version). Recording only — this performs no live rollback action
-    itself; rollback execution is not authorized/implemented here."""
+    """Record ROLLED_BACK for `version`, or — when not given — for the
+    live manifest's version (the same unambiguous fallback as
+    connect_mark_failed, for the same reason). Recording only — this
+    performs no live rollback action itself; rollback execution is not
+    authorized/implemented here."""
     with sftp_session(env) as sftp:
         root = env["SERVER_SFTP_PATH"]
-        target_version = version or (deploy_state.read_state(sftp, root) or {}).get("version")
+        target_version = version or live_manifest_version(sftp, root)
         if not target_version:
-            raise ValueError("Cannot mark rolled back: no candidate version on record and none given")
+            raise ValueError("Cannot mark rolled back: no candidate version given and the live manifest has none on record")
         return deploy_state.write_state(sftp, root, target_version, deploy_state.ROLLED_BACK, now=utcnow)
 
 

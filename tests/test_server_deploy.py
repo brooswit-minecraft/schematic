@@ -831,6 +831,26 @@ class DeployStateWiringTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Stale release"):
                 deploy.connect_mark_requested(str(older_output), self.env)
 
+    def test_mark_requested_rejects_stale_candidate_even_after_a_newer_request_overwrote_the_record(self):
+        # The exact PR #63 review scenario, driven entirely through the
+        # public CLI-level helpers rather than deploy_state directly:
+        # healthy(2) -> requested(3) -> candidate(1) must still be
+        # rejected, even though the "current attempt" by the third call
+        # reads requested/3, not healthy/2.
+        deploy_state.write_state(self.sftp, "/server", "2", deploy_state.HEALTHY, now=deploy.utcnow)
+        output_3 = self.root / "output-3"
+        self.write_manifest(output_3, "3")
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            deploy.connect_mark_requested(str(output_3), self.env)
+        record = json.loads((self.remote / "server" / ".schematic-deploy-state.json").read_text())
+        self.assertEqual((record["state"], record["version"]), ("requested", "3"))
+
+        output_1 = self.root / "output-1"
+        self.write_manifest(output_1, "1")
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            with self.assertRaisesRegex(ValueError, "Stale release"):
+                deploy.connect_mark_requested(str(output_1), self.env)
+
     def test_mark_healthy_reads_version_from_the_live_manifest(self):
         self.write_live_manifest("1.2.3")
         with mock.patch.object(deploy, "sftp_session", self.fake_session):
@@ -842,8 +862,13 @@ class DeployStateWiringTest(unittest.TestCase):
             record = deploy.connect_mark_failed(self.env, version="1.2.3")
         self.assertEqual((record["state"], record["version"]), ("failed", "1.2.3"))
 
-    def test_mark_failed_falls_back_to_the_recorded_candidate_version(self):
-        deploy_state.write_state(self.sftp, "/server", "1.2.3", deploy_state.UPDATING, now=deploy.utcnow)
+    def test_mark_failed_falls_back_to_the_live_manifest_version(self):
+        # Not the deploy-state record's own version (PR #63 review): that
+        # record can belong to an unrelated, newer attempt by the time a
+        # failure handler runs. Set the two to clearly different values to
+        # prove the live manifest, not the state record, wins.
+        self.write_live_manifest("1.2.3")
+        deploy_state.write_state(self.sftp, "/server", "9.9.9", deploy_state.UPDATING, now=deploy.utcnow)
         with mock.patch.object(deploy, "sftp_session", self.fake_session):
             record = deploy.connect_mark_failed(self.env)
         self.assertEqual((record["state"], record["version"]), ("failed", "1.2.3"))
@@ -852,6 +877,21 @@ class DeployStateWiringTest(unittest.TestCase):
         with mock.patch.object(deploy, "sftp_session", self.fake_session):
             with self.assertRaisesRegex(ValueError, "no candidate version"):
                 deploy.connect_mark_failed(self.env)
+
+    def test_mark_failed_does_not_clobber_a_newer_installed_version_floor(self):
+        # A stale job's own failure (candidate "1", refused as stale) must
+        # not move the durable installed_version protection backwards,
+        # even though mark-failed's own fallback resolves to the live
+        # manifest (which, for this scenario, IS the newer version).
+        self.write_live_manifest("3")
+        deploy_state.write_state(self.sftp, "/server", "3", deploy_state.HEALTHY, now=deploy.utcnow)
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            deploy.connect_mark_failed(self.env, version="1")
+        stale_output = self.root / "stale-output"
+        self.write_manifest(stale_output, "1")
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            with self.assertRaisesRegex(ValueError, "Stale release"):
+                deploy.connect_mark_requested(str(stale_output), self.env)
 
     def test_mark_rolled_back_with_explicit_version(self):
         with mock.patch.object(deploy, "sftp_session", self.fake_session):
@@ -887,6 +927,28 @@ class DeployStateWiringTest(unittest.TestCase):
         with mock.patch.object(deploy, "connect_mark_failed") as mark_failed:
             deploy.mark_failed_best_effort({}, output_dir=str(output))
         mark_failed.assert_called_once_with({}, version="1.0.0")
+
+    def test_a_delayed_stale_jobs_own_failure_cannot_clobber_a_newer_success(self):
+        # A newer release (3) already went healthy. A delayed, stale job
+        # for an older release (1) — refused by its own mark-requested
+        # guard — then best-effort records its own failure using the
+        # version it actually knows (its local output's manifest, "1"),
+        # explicitly, not the live manifest fallback. That must not move
+        # the durable installed_version floor backwards.
+        self.write_live_manifest("3")
+        deploy_state.write_state(self.sftp, "/server", "3", deploy_state.HEALTHY, now=deploy.utcnow)
+        stale_output = self.root / "stale-output"
+        self.write_manifest(stale_output, "1")
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            with self.assertRaisesRegex(ValueError, "Stale release"):
+                deploy.connect_mark_requested(str(stale_output), self.env)
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            deploy.mark_failed_best_effort(self.env, output_dir=str(stale_output))
+        record = json.loads((self.remote / "server" / ".schematic-deploy-state.json").read_text())
+        self.assertEqual(record["installed_version"], "3")
+        with mock.patch.object(deploy, "sftp_session", self.fake_session):
+            with self.assertRaisesRegex(ValueError, "Stale release"):
+                deploy.connect_mark_requested(str(stale_output), self.env)
 
 
 if __name__ == "__main__":

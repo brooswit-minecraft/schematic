@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import importlib.util
+import json
 from pathlib import Path
 import shutil
 import tempfile
@@ -81,8 +82,15 @@ class DeployStateTest(unittest.TestCase):
         with self.assertRaises(Exception):
             deploy_state.read_state(self.sftp, "/server")
 
-    def test_read_state_rejects_invalid_schema(self):
-        (self.root / deploy_state.STATE_FILE).write_text('{"schema": 1, "version": "1.0.0", "state": "nonsense", "updated_at": "x"}')
+    def test_read_state_rejects_invalid_state_value(self):
+        (self.root / deploy_state.STATE_FILE).write_text(json.dumps(
+            {"schema": 2, "version": "1.0.0", "state": "nonsense", "updated_at": "x", "installed_version": None}))
+        with self.assertRaisesRegex(ValueError, "Invalid deployment-state record"):
+            deploy_state.read_state(self.sftp, "/server")
+
+    def test_read_state_rejects_old_schema_version(self):
+        (self.root / deploy_state.STATE_FILE).write_text(json.dumps(
+            {"schema": 1, "version": "1.0.0", "state": "healthy", "updated_at": "x"}))
         with self.assertRaisesRegex(ValueError, "Invalid deployment-state record"):
             deploy_state.read_state(self.sftp, "/server")
 
@@ -118,6 +126,66 @@ class DeployStateTest(unittest.TestCase):
     def test_guard_compares_numerically_not_lexicographically(self):
         deploy_state.write_state(self.sftp, "/server", "0.9.0", deploy_state.HEALTHY, now=fixed_now)
         deploy_state.guard_stale_release(self.sftp, "/server", "0.10.0")  # 0.10.0 > 0.9.0 numerically
+
+    # --- PR #63 review: installed_version must survive being overwritten
+    # by a later attempt's own requested/failed record (regressions from
+    # the reviewer's exact scenarios). ---
+
+    def test_installed_version_survives_a_later_requested_overwrite(self):
+        deploy_state.write_state(self.sftp, "/server", "2", deploy_state.HEALTHY, now=fixed_now)
+        # A newer release being requested overwrites the "current attempt"
+        # fields, but must not erase the installed_version floor that "2"
+        # already set.
+        record = deploy_state.write_state(self.sftp, "/server", "3", deploy_state.REQUESTED, now=fixed_now)
+        self.assertEqual(record["installed_version"], "2")
+
+    def test_stale_candidate_rejected_even_after_a_newer_request_overwrote_the_record(self):
+        # healthy(2) -> requested(3) -> candidate(1) must still be rejected,
+        # even though the "current attempt" by then reads requested/3, not
+        # healthy/2 — this was the exact gap PR #63 review found.
+        deploy_state.write_state(self.sftp, "/server", "2", deploy_state.HEALTHY, now=fixed_now)
+        deploy_state.write_state(self.sftp, "/server", "3", deploy_state.REQUESTED, now=fixed_now)
+        with self.assertRaisesRegex(ValueError, "Stale release"):
+            deploy_state.guard_stale_release(self.sftp, "/server", "1")
+
+    def test_failed_pre_upload_request_for_a_newer_version_leaves_installed_protected(self):
+        # healthy(2) -> failed(3) (e.g. 3 never reached upload()) must still
+        # protect 2 — and must still reject a stale candidate below 2.
+        deploy_state.write_state(self.sftp, "/server", "2", deploy_state.HEALTHY, now=fixed_now)
+        record = deploy_state.write_state(self.sftp, "/server", "3", deploy_state.FAILED, now=fixed_now)
+        self.assertEqual(record["installed_version"], "2")
+        with self.assertRaisesRegex(ValueError, "Stale release"):
+            deploy_state.guard_stale_release(self.sftp, "/server", "1")
+
+    def test_a_stale_jobs_failed_write_cannot_clobber_a_newer_installed_version(self):
+        # A delayed/stale job for version 1 recording its own FAILED after
+        # version 3 has already gone healthy must not move the installed
+        # floor backwards.
+        deploy_state.write_state(self.sftp, "/server", "3", deploy_state.HEALTHY, now=fixed_now)
+        record = deploy_state.write_state(self.sftp, "/server", "1", deploy_state.FAILED, now=fixed_now)
+        self.assertEqual(record["installed_version"], "3")
+        deploy_state.guard_stale_release(self.sftp, "/server", "3")  # same-version retry still allowed
+        with self.assertRaisesRegex(ValueError, "Stale release"):
+            deploy_state.guard_stale_release(self.sftp, "/server", "2")
+
+    def test_installed_version_only_advances_forward_never_backward(self):
+        deploy_state.write_state(self.sftp, "/server", "3", deploy_state.HEALTHY, now=fixed_now)
+        # Re-recording UPDATING for the same (not a newer) version must not
+        # regress installed_version, and retrying the same version is fine.
+        record = deploy_state.write_state(self.sftp, "/server", "3", deploy_state.UPDATING, now=fixed_now)
+        self.assertEqual(record["installed_version"], "3")
+
+    def test_write_state_round_trip_includes_installed_version(self):
+        written = deploy_state.write_state(self.sftp, "/server", "0.53.0", deploy_state.UPDATING, now=fixed_now)
+        self.assertEqual(written["installed_version"], "0.53.0")
+        read = deploy_state.read_state(self.sftp, "/server")
+        self.assertEqual(read, written)
+
+    def test_read_state_rejects_record_missing_installed_version_type(self):
+        (self.root / deploy_state.STATE_FILE).write_text(json.dumps(
+            {"schema": 2, "version": "1.0.0", "state": "healthy", "updated_at": "x", "installed_version": 42}))
+        with self.assertRaisesRegex(ValueError, "Invalid deployment-state record"):
+            deploy_state.read_state(self.sftp, "/server")
 
 
 if __name__ == "__main__":

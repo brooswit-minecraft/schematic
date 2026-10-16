@@ -497,6 +497,7 @@ jobs:
           SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
         run: python .schematic-tools/scripts/server_deploy.py preflight
       - name: Verify running server, install supervisor, and atomically upload files
+        id: deploy
         env:
           SERVER_RCON_HOST: ${{ vars.SERVER_RCON_HOST }}
           SERVER_RCON_PORT: ${{ vars.SERVER_RCON_PORT }}
@@ -567,12 +568,19 @@ jobs:
       # MINECRAFT-40: catches a failure between a successful `deploy` step
       # and a successful `restart` step (e.g. the supervisor-configuration
       # step above) that neither of those two steps' own best-effort
-      # mark-failed handling would see. Best-effort itself: a job that
-      # failed before any SFTP config was even usable leaves no durable
-      # record, which is fine — the job's own failed conclusion is already
-      # the evidence for that case.
+      # mark-failed handling would see. Gated on `deploy` itself having
+      # succeeded: `mark-failed`'s no-version fallback resolves to the
+      # LIVE manifest's version (see live_manifest_version's docstring),
+      # which is only guaranteed to be THIS run's own candidate once
+      # `deploy` has already promoted it — a failure any earlier (e.g.
+      # resolving/downloading the release) must NOT fall into this step,
+      # or it would mislabel the previous, unrelated release as failed.
+      # Best-effort itself beyond that: a job that failed before any SFTP
+      # config was even usable leaves no durable record, which is fine —
+      # the job's own failed conclusion is already the evidence for that
+      # case.
       - name: Record a failed deployment state, best-effort
-        if: failure()
+        if: failure() && steps.deploy.outcome == 'success'
         continue-on-error: true
         env:
           SERVER_SFTP_HOST: ${{ vars.SERVER_SFTP_HOST }}
