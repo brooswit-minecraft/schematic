@@ -17,9 +17,32 @@ that workflow's behavior.
 
 A calling repo's own checkout (at `sha`) is **not** assumed to contain
 `scripts/release_state.py` — this workflow checks that helper out itself
-from `brooswit-minecraft/schematic` (pinned to `schematic-ref`) into
-`.schematic-mechanism/` in every job that needs it, so a consumer repo
-needs nothing copied in to use this workflow.
+from `brooswit-minecraft/schematic` (pinned to the REQUIRED `schematic-ref`
+input) into `.schematic-mechanism/` in every job that needs it, so a
+consumer repo needs nothing copied in to use this workflow. Each such
+checkout is immediately followed by a fail-fast check that
+`.schematic-mechanism/scripts/release_state.py` actually exists — a
+`schematic-ref` that resolves but doesn't contain the helper (e.g. the `v1`
+tag, cut before this helper existed) fails loudly with an actionable
+`::error::` naming the problem, not a confusing Python traceback three
+steps later.
+
+**Why `schematic-ref` has no default**: `v1` is this repo's existing stable
+tag, but it predates `reusable-accepted-merge-release.yml` entirely and
+does not contain `scripts/release_state.py` — defaulting to it would be a
+default that is silently broken for every caller until `v1` is next cut
+(which this PR, under the active MINECRAFT-12 release hold, is not
+authorized to do). Requiring the input instead means a caller always pins
+to something that was actually checked to contain the helper.
+
+**A concrete, currently-valid example**: commit
+`324ed36482cf43b82bf8de136373bcb65d68c572` on this repo's `MINECRAFT-371`
+branch contains `scripts/release_state.py` (verify with `gh api
+repos/brooswit-minecraft/schematic/contents/scripts/release_state.py?ref=324ed36482cf43b82bf8de136373bcb65d68c572`).
+Once this PR merges into `MINECRAFT-44` and that merges to `main`, pin
+`schematic-ref` to the resulting commit SHA on `main` instead (verify the
+same way); once a `v1` tag is next cut on a commit at or after that merge,
+pin to `v1` again.
 
 ## Calling it
 
@@ -34,6 +57,7 @@ jobs:
       version: ${{ needs.policy.outputs.version }}
       authorized: ${{ needs.policy.outputs.authorized == 'true' }}
       hold: ${{ needs.policy.outputs.hold == 'true' }}
+      schematic-ref: '324ed36482cf43b82bf8de136373bcb65d68c572'  # see note above — re-pin once merged/tagged
     secrets: inherit
 ```
 
@@ -48,7 +72,7 @@ jobs:
 | `modrinth-required` | no (default `true`) | boolean | When `true` and Modrinth isn't configured, the run **fails** rather than silently publishing GitHub-only. |
 | `notes-file` | no (default `''`) | string | Repo-relative path, read at the checked-out `sha`, used as both the GitHub release body and the Modrinth changelog. |
 | `rinth-ref` | no (default `v0.9.1`) | string | Pinned `brooswit-minecraft/rinth` tag invoked via `bunx`. |
-| `schematic-ref` | no (default `v1`) | string | Pinned `brooswit-minecraft/schematic` tag/sha this workflow checks its own mechanism helper out from. Pin this the same way you pin the workflow's own `uses: ...@<ref>` — the two should normally match. |
+| `schematic-ref` | **yes, no default** | string | Exact `brooswit-minecraft/schematic` commit SHA (or tag, once one exists that contains the helper) this workflow checks its own mechanism helper (`scripts/release_state.py`) out from. See "a concrete, currently-valid example" above. A value that doesn't contain the helper fails fast with an actionable error (see above), not silently. |
 
 An invalid `sha` or `version` fails the run before any checkout/build step
 with an actionable `::error::`.

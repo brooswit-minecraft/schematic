@@ -80,13 +80,18 @@ on:
         default: 'v0.9.1'
       schematic-ref:
         description: >-
-          Pinned brooswit-minecraft/schematic tag/sha this workflow itself
-          checks out its own mechanism helper (scripts/release_state.py)
-          from. Pin this the same way a consumer pins the workflow's own
-          `uses: ...@<ref>` — the two should normally match.
-        required: false
+          REQUIRED, no default: the exact brooswit-minecraft/schematic
+          commit SHA (or tag, once one exists that contains
+          scripts/release_state.py) this workflow checks its own mechanism
+          helper out from. There is deliberately no default here — `v1`
+          predates this helper and does not contain it (checking that out
+          would fail fast with an actionable error, not silently misbehave,
+          but an input you have to look up anyway should not masquerade as
+          optional). See docs/accepted-merge-release-contract.md for a
+          concrete, currently-valid example SHA, and re-pin to the next cut
+          of `v1` once one exists.
+        required: true
         type: string
-        default: 'v1'
     outputs:
       state:
         description: 'One of: build-only, held, skipped, publishing, published, failed.'
@@ -130,6 +135,15 @@ jobs:
           repository: brooswit-minecraft/schematic
           ref: ${{ inputs.schematic-ref }}
           path: .schematic-mechanism
+
+      - name: Confirm the mechanism helper exists at schematic-ref
+        env:
+          SCHEMATIC_REF: ${{ inputs.schematic-ref }}
+        run: |
+          if [ ! -f .schematic-mechanism/scripts/release_state.py ]; then
+            echo "::error::schematic-ref '$SCHEMATIC_REF' does not contain scripts/release_state.py — pin schematic-ref to a brooswit-minecraft/schematic commit SHA (or, once one exists, a tag) that includes this file. See docs/accepted-merge-release-contract.md for a concrete example."
+            exit 1
+          fi
 
       - name: Validate sha and version
         id: validate
@@ -189,6 +203,15 @@ jobs:
           repository: brooswit-minecraft/schematic
           ref: ${{ inputs.schematic-ref }}
           path: .schematic-mechanism
+
+      - name: Confirm the mechanism helper exists at schematic-ref
+        env:
+          SCHEMATIC_REF: ${{ inputs.schematic-ref }}
+        run: |
+          if [ ! -f .schematic-mechanism/scripts/release_state.py ]; then
+            echo "::error::schematic-ref '$SCHEMATIC_REF' does not contain scripts/release_state.py — pin schematic-ref to a brooswit-minecraft/schematic commit SHA (or, once one exists, a tag) that includes this file. See docs/accepted-merge-release-contract.md for a concrete example."
+            exit 1
+          fi
 
       - uses: actions/setup-go@v5
         with:
