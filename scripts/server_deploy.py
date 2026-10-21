@@ -892,9 +892,9 @@ def archive_and_prune(sftp, root, retention, tar_dir, tag="deploy", now=None):
     object directly (not a connection) so it is testable against FakeSFTP
     exactly like upload()/install_supervisor() above, independent of RCON or
     paramiko."""
-    root = root.rstrip("/")
     if not root.startswith("/") or any(p in (".", "..") for p in root.split("/")) or "\\" in root:
         raise ValueError("SFTP path must be an absolute server directory")
+    root = root.rstrip("/")
     directory(sftp, root or "/")
     backups_dir = root + "/backups"
     directory(sftp, backups_dir, create=True)

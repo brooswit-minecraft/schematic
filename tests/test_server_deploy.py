@@ -602,6 +602,53 @@ class DeploymentTest(unittest.TestCase):
         self.assertEqual(names, ["world/level.dat", "world/region/r.0.0.mca", "world_nether/level.dat"])
         self.assertFalse(list((self.remote / "server/backups").glob(deploy.BACKUP_STAGE_PREFIX + "*")))
 
+    def test_backup_absolute_roots_preserve_safe_remote_paths(self):
+        for root in ("/", "/server", "/server/", "/nested/server", "/nested/server///"):
+            with self.subTest(root=root), tempfile.TemporaryDirectory() as remote_dir, \
+                 tempfile.TemporaryDirectory() as tar_dir:
+                sftp = FakeSFTP(Path(remote_dir))
+                server = sftp.path(root)
+                (server / "world/region").mkdir(parents=True)
+                (server / "world/level.dat").write_bytes(b"leveldata")
+                (server / "world/region/r.0.0.mca").write_bytes(b"regiondata")
+                (server / "server.properties").write_text("level-name=world\n")
+                observed_paths = []
+                original_path = sftp.path
+
+                def checked_path(path):
+                    observed_paths.append(path)
+                    self.assertTrue(path.startswith("/"), path)
+                    self.assertNotIn("//", path)
+                    self.assertNotIn("..", path.split("/"))
+                    self.assertNotIn(".", path.split("/"))
+                    prefix = root.rstrip("/")
+                    # directory() also checks each ancestor for symlinks.
+                    self.assertTrue(path == (prefix or "/") or path.startswith(prefix + "/")
+                                    or prefix.startswith(path + "/"), path)
+                    return original_path(path)
+
+                with mock.patch.object(sftp, "path", side_effect=checked_path):
+                    result = deploy.archive_and_prune(sftp, root, 5, tar_dir, tag="1.2.3")
+                self.assertIn(root.rstrip("/") + "/server.properties", observed_paths)
+                self.assertIn(root.rstrip("/") + "/backups/" + result["archive"], observed_paths)
+                self.assertEqual(result["files"], 2)
+                self.assertEqual(result["removed"], [])
+                with tarfile.open(server / "backups" / result["archive"]) as archive:
+                    self.assertEqual(sorted(archive.getnames()),
+                                     ["world/level.dat", "world/region/r.0.0.mca"])
+                    self.assertEqual(archive.extractfile("world/level.dat").read(), b"leveldata")
+                self.assertEqual((server / "world/level.dat").read_bytes(), b"leveldata")
+
+    def test_backup_rejects_unsafe_roots_before_sftp_access(self):
+        for root in ("", "server", "server/", ".", "..", "./server", "../server",
+                     "/server/../world", "/server/./world", "/server/..///",
+                     "/server/.", "/server\\world", "C:/server"):
+            with self.subTest(root=root):
+                sftp = mock.Mock()
+                with self.assertRaisesRegex(ValueError, "absolute server directory"):
+                    deploy.archive_and_prune(sftp, root, 5, self.root)
+                self.assertEqual(sftp.mock_calls, [])
+
     def test_backup_rejects_remote_name_collision(self):
         when = datetime(2026, 9, 20, 6, 30, 0, tzinfo=timezone.utc)
         backups = self.remote / "server/backups"
